@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>3 · ASR Deep Dive — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>ASR <span>Deep Dive</span></h1>
+  <p>From your CTC recognizer to Whisper: three answers to the same question —
+     how do you supervise a model when nobody tells you which frame is which letter?
+     Code: <code>src/asr/</code>, <code>src/pipeline/asr.py</code>.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← hub</a> · <a href="02-vad.html">vad</a></div>
+
+<h2><span class="num">3.1</span>The alignment problem is the whole subject</h2>
+<p>An utterance is ~400 feature frames; its transcript is ~40 characters. Training data
+gives you the pair, never the mapping — nobody labels "frames 51–63 are the letter <em>c</em>".
+Every ASR architecture is fundamentally a different answer to <strong>where does the
+alignment come from?</strong></p>
+
+<div class="tablewrap"><table>
+<tr><th>Family</th><th>Alignment mechanism</th><th>Streaming?</th><th>Examples</th></tr>
+<tr><td><strong>CTC</strong> (yours)</td><td>emit a symbol (or blank) <em>every frame</em>; sum over all frame-strings that collapse to the target</td><td>yes (with a causal encoder)</td><td>DeepSpeech 2, wav2vec 2.0 fine-tunes</td></tr>
+<tr><td><strong>RNN-T</strong></td><td>a learned joiner decides at each frame: emit another token or consume the next frame</td><td><strong>yes — its reason to exist</strong></td><td>Google/Apple on-device dictation, Conformer-T</td></tr>
+<tr><td><strong>Attention enc-dec</strong></td><td>a text decoder <em>generates</em> tokens, softly attending over all audio frames</td><td>not naturally (wants the full utterance)</td><td><strong>Whisper</strong>, LAS</td></tr>
+</table></div>
+
+<h2><span class="num">3.2</span>CTC, compressed to its three ideas</h2>
+<p>(Your Modules 2/2b implement all of this by hand — <code>src/asr/text.py</code>,
+<code>model.py</code>, <code>decode.py</code>. This is the summary to hold in your head.)</p>
+<ol>
+<li><strong>The collapse rule.</strong> The model emits one symbol per frame over
+{chars + <em>blank</em>}. Decoding = merge adjacent repeats, then delete blanks:
+<code>cc–aa–t → cat</code>. The blank is what lets the model say "nothing new this frame"
+and what separates genuine doubles (<code>hel–lo</code> needs a blank between the l's).</li>
+<li><strong>The loss.</strong> Many frame-strings collapse to the same text. CTC loss =
+−log of the <em>sum</em> of their probabilities (computed by dynamic programming). The
+model is free to discover its own alignment — early in training the probability mass sits
+on "all blanks", then crisp spikes of characters emerge. </li>
+<li><strong>Decoding.</strong> Greedy (argmax per frame, then collapse) commits to one
+alignment. Prefix beam search — your <code>decode.py</code> — carries the top-k text
+prefixes, each tracking P(ends in blank) vs P(ends in symbol), summing over alignments
+properly. That blank/non-blank split is the trick to score repeated characters right.</li>
+</ol>
+<p>CTC's built-in flaw: it predicts each frame <strong>conditionally independently</strong> —
+there's no language model inside it, so it happily writes "shold" where a decoder that
+remembers its own output would write "should". Fixes: bolt an external LM onto the beam
+(production CTC systems), or move the language model inside — which is exactly the next
+two architectures.</p>
+
+<h2><span class="num">3.3</span>Whisper: what 680k hours + a decoder buys</h2>
+<div class="diagram">
+ log-mel (3000×80, 30 s window)
+   ▼
+ <span class="a">Transformer encoder</span>  (self-attention over audio)        <span class="m">"listen"</span>
+   ▼                        cross-attention
+ <span class="b">Transformer decoder</span>  ─────────────────────▶ tokens      <span class="m">"write, while glancing back"</span>
+ &lt;|en|&gt; &lt;|transcribe|&gt; The staircase groaned ... &lt;|eot|&gt;
+</div>
+<ul>
+<li><strong>Alignment</strong> is implicit in cross-attention: each generated token looks back
+at the audio frames it needs. No blanks, no collapse rule.</li>
+<li><strong>The decoder IS a language model</strong> — trained jointly, it fixes CTC's
+independence problem, which is why Whisper's output has correct spelling and punctuation.
+The dark side: when audio is empty/garbled, a language model with a microphone
+<em>keeps talking</em> — Whisper's infamous hallucinated sentences on silence. Two of our
+pipeline choices exist purely to manage this: the endpointer never sends
+sub-250 ms blips, and <code>condition_on_previous_text=False</code> stops hallucination
+loops from compounding across turns.</li>
+<li><strong>Trained on ~680k hours</strong> of weakly-labeled web audio. Your model saw
+~25 minutes. That five-orders-of-magnitude gap, not the architecture, is most of the
+quality difference (the Transformer helps, but a Transformer on 25 minutes would fail too).</li>
+</ul>
+
+<h3>Measured on this repo, same LibriSpeech utterance</h3>
+<div class="kpi">
+  <div class="box"><div class="v">0.012</div><div class="k">CER — whisper base.en int8</div></div>
+  <div class="box"><div class="v">~0.7</div><div class="k">CER — scratch CTC (unseen utterance)</div></div>
+  <div class="box"><div class="v">317 ms</div><div class="k">whisper latency (RTF 0.08)</div></div>
+  <div class="box"><div class="v">47 ms</div><div class="k">scratch latency (RTF 0.01)</div></div>
+</div>
+<p>Note the second axis: your model is ~7× <em>faster</em>. Tiny CTC models still get
+deployed where latency/compute dominate and vocabulary is narrow (wake words, command
+grammars, embedded devices). Speed is a feature; Whisper isn't a strict upgrade.</p>
+
+<h2><span class="num">3.4</span>Streaming ASR vs. what we built</h2>
+<p>Our pipeline transcribes <strong>whole utterances</strong> after the endpointer closes a
+turn. Honest trade-off: simplest, most accurate per utterance (full context), but no live
+captions, and the ASR cost lands entirely inside the turnaround budget.</p>
+<p>True streaming (word-by-word partials while you talk) needs a model whose encoder is
+<em>causal</em> — RNN-T, or chunked-attention Conformers. That's what powers live captions
+and lets voice agents do smarter things: semantic endpointing (read the partial transcript
+to decide if the user is done) and speculative LLM prefill on partial text. The
+production pattern at Deepgram/AssemblyAI/Google is RNN-T-style streaming with partial
+results that <em>stabilize</em> over time (early words may be revised).</p>
+<div class="callout">
+  <span class="label">Why we chose utterance-based anyway</span>
+  Most open self-hosted voice agents (pipecat, LiveKit examples) do exactly this with
+  faster-whisper: at 0.08 RTF the whole turn transcribes in ~300 ms, which fits inside the
+  700 ms endpoint wait that exists regardless. Streaming partials matter when turns are
+  long, captions are the product, or you're doing semantic endpointing.
+</div>
+
+<h2><span class="num">3.5</span>Inference engines: why "faster-whisper" isn't just whisper</h2>
+<p>Training frameworks (PyTorch) optimize for flexibility and gradients. Inference engines
+optimize for one thing: forward pass throughput. faster-whisper = Whisper's exact weights
+executed by <strong>CTranslate2</strong>:</p>
+<ul>
+<li><strong>Int8 weight quantization</strong> — weights stored as 8-bit ints (4× smaller,
+CPU SIMD-friendly), activations computed in higher precision. ~4× faster on CPU, WER
+essentially unchanged. Same idea as GGUF/llama.cpp quantization for LLMs.</li>
+<li><strong>Fused kernels</strong> — attention+layernorm+GEMM fused into single ops; no
+Python in the loop, no autograd bookkeeping.</li>
+<li><strong>Batching machinery</strong> — multiple streams share one forward pass (the GPU
+economics of serving; see the production page).</li>
+</ul>
+<p>The general lesson: <strong>train in one tool, serve in another</strong> — PyTorch →
+ONNX Runtime (how Silero and Kokoro ship), CTranslate2, TensorRT, vLLM. The export seam
+is a permanent fixture of production ML.</p>
+
+<h2><span class="num">3.6</span>Evaluation, properly</h2>
+<ul>
+<li><strong>WER</strong> (word error rate) = word-level edit distance ÷ reference words —
+the industry headline number. <strong>CER</strong> (ours) is the character version, kinder
+to small models and language-agnostic.</li>
+<li>Always report <strong>seen vs held-out</strong> separately — your Module 2b's ~0 train CER
+vs high held-out CER is the data-hunger gap made visible, and it's why "we hit 2% WER"
+means nothing without knowing the test set.</li>
+<li>Real evals slice by domain: accents, noise (SNR sweeps), telephony 8 kHz, far-field,
+code-switching. LibriSpeech-clean is the <em>easiest</em> public benchmark — treat numbers
+on it as upper bounds.</li>
+</ul>
+
+<h2><span class="num">3.7</span>If you want to push the scratch model</h2>
+<ol>
+<li><strong>Data first</strong>: train-clean-100 (100 h) instead of 5.4 h of dev-clean; that
+alone moves held-out CER more than any architecture change.</li>
+<li><strong>SpecAugment</strong>: random time/frequency masks on the mel — the single
+highest-value regularizer in speech, ~5 lines.</li>
+<li><strong>Subword units</strong> (BPE) instead of characters: shorter targets, easier CTC.</li>
+<li><strong>Conformer blocks</strong> instead of BiGRU: convolution + self-attention, the
+modern encoder default.</li>
+<li><strong>Shallow LM fusion</strong>: add a char-LM score inside your beam search — directly
+attacks CTC's independence assumption.</li>
+</ol>
+
+</main>
+<footer class="nav">
+  <a href="02-vad.html">← VAD</a>
+  <a href="04-tts.html">Next: TTS deep dive →</a>
+</footer>
+</body>
+</html>

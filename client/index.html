@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Voice Pipeline — Live Client</title>
+<style>
+  :root {
+    --bg: #0b0f17; --card: #161d2e; --line: #273249; --text: #e6ebf4;
+    --muted: #9aa7bd; --accent: #5eead4; --accent-2: #8b9cff; --red: #fb7185;
+    --green: #34d399; --warn: #fbbf24;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); line-height: 1.5;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { max-width: 780px; margin: 0 auto; padding: 32px 20px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+  .bar { display: flex; gap: 12px; align-items: center; margin-bottom: 18px; }
+  button { background: var(--accent); color: #06251f; border: 0; font-weight: 700;
+    padding: 10px 22px; border-radius: 10px; font-size: 15px; cursor: pointer; }
+  button.stop { background: var(--red); color: #2b0710; }
+  button:disabled { opacity: .5; cursor: default; }
+  .pill { font-family: var(--mono); font-size: 13px; padding: 5px 14px;
+    border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
+    background: var(--card); }
+  .pill.listening    { color: var(--accent);   border-color: var(--accent); }
+  .pill.user_speaking{ color: var(--warn);     border-color: var(--warn); }
+  .pill.thinking     { color: var(--accent-2); border-color: var(--accent-2); }
+  .pill.speaking     { color: var(--green);    border-color: var(--green); }
+  #log { background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 16px; min-height: 260px; max-height: 50vh; overflow-y: auto; }
+  .msg { margin: 8px 0; font-size: 15px; }
+  .msg .who { font-family: var(--mono); font-size: 12px; margin-right: 8px; }
+  .msg.you .who { color: var(--warn); } .msg.agent .who { color: var(--green); }
+  .msg.sys { color: var(--muted); font-size: 13px; font-family: var(--mono); }
+  #stats { margin-top: 14px; display: flex; gap: 18px; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 13px; color: var(--muted); }
+  #stats b { color: var(--text); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Voice pipeline <span>live client</span></h1>
+  <div class="sub" id="sub">mic → PCM16/16kHz over WebSocket → VAD → endpoint → ASR → reply → TTS → back to you. Interrupt it mid-sentence to see barge-in.</div>
+  <div class="bar">
+    <button id="btn">Start mic</button>
+    <span id="state" class="pill">disconnected</span>
+  </div>
+  <div id="log"></div>
+  <div id="stats">
+    <span>vad P(speech) <b id="s-vad">–</b></span>
+    <span>turnaround <b id="s-turn">–</b></span>
+    <span>asr <b id="s-asr">–</b></span>
+    <span>tts/sentence <b id="s-tts">–</b></span>
+  </div>
+</div>
+
+<script>
+const TARGET_SR = 16000;
+const btn = document.getElementById('btn');
+const stateEl = document.getElementById('state');
+const logEl = document.getElementById('log');
+
+let ws, micCtx, playCtx, workletNode, mediaStream;
+let running = false;
+let ttsSampleRate = 24000;
+let nextPlayTime = 0;
+let liveSources = [];      // scheduled TTS buffers, so barge-in can kill them
+let pending = new Float32Array(0);
+
+function log(who, text) {
+  const div = document.createElement('div');
+  div.className = 'msg ' + who;
+  div.innerHTML = who === 'sys' ? text : `<span class="who">${who === 'you' ? 'YOU' : 'AGENT'}</span>${text}`;
+  logEl.appendChild(div);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setState(s) { stateEl.textContent = s; stateEl.className = 'pill ' + s; }
+
+// ---- mic capture: worklet posts 128-sample blocks at the context rate;
+// we linearly resample to 16 kHz, quantize to int16, ship ~32 ms per frame ----
+function resampleTo16k(input, fromRate) {
+  const ratio = fromRate / TARGET_SR;
+  const outLen = Math.floor(input.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * ratio, i0 = Math.floor(pos), frac = pos - i0;
+    out[i] = input[i0] * (1 - frac) + (input[Math.min(i0 + 1, input.length - 1)]) * frac;
+  }
+  return out;
+}
+
+function onMicBlock(block) {
+  const ds = resampleTo16k(block, micCtx.sampleRate);
+  const merged = new Float32Array(pending.length + ds.length);
+  merged.set(pending); merged.set(ds, pending.length);
+  pending = merged;
+  const FRAME = 512; // 32 ms @ 16 kHz — one Silero window per WS message
+  while (pending.length >= FRAME) {
+    const chunk = pending.subarray(0, FRAME);
+    pending = pending.slice(FRAME);
+    const pcm = new Int16Array(FRAME);
+    for (let i = 0; i < FRAME; i++) pcm[i] = Math.max(-32768, Math.min(32767, chunk[i] * 32767));
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(pcm.buffer);
+  }
+}
+
+// ---- TTS playback: schedule chunks back to back; flush hard on barge-in ----
+function playChunk(arrayBuffer) {
+  const pcm = new Int16Array(arrayBuffer);
+  const f32 = new Float32Array(pcm.length);
+  for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 32768;
+  const buf = playCtx.createBuffer(1, f32.length, ttsSampleRate);
+  buf.copyToChannel(f32, 0);
+  const src = playCtx.createBufferSource();
+  src.buffer = buf; src.connect(playCtx.destination);
+  const t = Math.max(playCtx.currentTime + 0.02, nextPlayTime);
+  src.start(t);
+  nextPlayTime = t + buf.duration;
+  liveSources.push(src);
+  src.onended = () => { liveSources = liveSources.filter(s => s !== src); };
+}
+function flushPlayback() {
+  liveSources.forEach(s => { try { s.stop(); } catch (e) {} });
+  liveSources = []; nextPlayTime = 0;
+}
+
+function onEvent(ev) {
+  switch (ev.type) {
+    case 'ready': {
+      const e = ev.engines || {};
+      document.getElementById('sub').textContent =
+        `mic → VAD (${e.vad}) → endpoint → ASR (${e.asr}) → reply (${e.responder}) → TTS (${e.tts}). Interrupt it mid-sentence to see barge-in.`;
+      log('sys', `engines: vad=${e.vad} asr=${e.asr} tts=${e.tts} responder=${e.responder}`);
+      break;
+    }
+    case 'vad': {
+      // Healthy: near 0 in silence, near 1 while YOU talk. Pinned high in
+      // silence = the VAD hears your room as speech (turns never end).
+      const el = document.getElementById('s-vad');
+      el.textContent = ev.prob.toFixed(2);
+      el.style.color = ev.prob > 0.5 ? 'var(--warn)' : 'var(--accent)';
+      break;
+    }
+    case 'state': setState(ev.state); break;
+    case 'transcript': if (ev.text) log('you', `${ev.text} <span class="who">(asr ${ev.latency_ms}ms, rtf ${ev.rtf})</span>`);
+      document.getElementById('s-asr').textContent = ev.latency_ms + 'ms'; break;
+    case 'reply': log('agent', ev.text); break;
+    case 'tts_start': ttsSampleRate = ev.sample_rate;
+      document.getElementById('s-turn').textContent = ev.turnaround_ms + 'ms'; break;
+    case 'tts_sentence': document.getElementById('s-tts').textContent = ev.latency_ms + 'ms'; break;
+    case 'interrupted': flushPlayback(); log('sys', '⚡ barge-in: agent flushed'); break;
+    case 'error': log('sys', '⚠ ' + ev.message); break;
+  }
+}
+
+async function start() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+  ws.onmessage = (m) => (typeof m.data === 'string') ? onEvent(JSON.parse(m.data)) : playChunk(m.data);
+  ws.onclose = () => { setState('disconnected'); };
+  await new Promise(r => ws.onopen = r);
+
+  // echoCancellation is the poor man's AEC: it stops the agent's own voice
+  // from re-entering the mic and triggering endless self-barge-in.
+  mediaStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
+  });
+  micCtx = new AudioContext();
+  playCtx = new AudioContext();
+  await micCtx.audioWorklet.addModule('/client/mic-worklet.js');
+  const src = micCtx.createMediaStreamSource(mediaStream);
+  workletNode = new AudioWorkletNode(micCtx, 'mic-capture');
+  workletNode.port.onmessage = (m) => onMicBlock(m.data);
+  src.connect(workletNode);
+
+  running = true; btn.textContent = 'Stop'; btn.className = 'stop';
+  log('sys', 'connected — speak!');
+}
+
+function stop() {
+  running = false;
+  flushPlayback();
+  if (workletNode) workletNode.disconnect();
+  if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+  if (micCtx) micCtx.close(); if (playCtx) playCtx.close();
+  if (ws) ws.close();
+  btn.textContent = 'Start mic'; btn.className = '';
+  setState('disconnected');
+}
+
+btn.onclick = () => running ? stop() : start().catch(e => log('sys', '⚠ ' + e.message));
+</script>
+</body>
+</html>

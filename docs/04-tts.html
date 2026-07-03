@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>4 · TTS Deep Dive — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>TTS <span>Deep Dive</span></h1>
+  <p>Speech synthesis as ASR's mirror image: instead of collapsing many frames to few
+     characters, you must <em>invent</em> how long every character sounds.
+     Code: <code>src/tts/</code>, trained by <code>scripts/08_train_tts.py</code>.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← hub</a> · <a href="03-asr.html">asr</a></div>
+
+<h2><span class="num">4.1</span>The two-stage decomposition</h2>
+<div class="diagram">
+ "the old man's eyes"                          <span class="m">~19 characters</span>
+   ▼  <span class="a">acoustic model</span> (learned)                 <span class="m">src/tts/model.py</span>
+ log-mel spectrogram (T×80)                    <span class="m">~250 frames — WHO DECIDES T?</span>
+   ▼  <span class="b">vocoder</span> (here: pure DSP, zero training)  <span class="m">src/tts/vocoder.py</span>
+ waveform @16 kHz                              <span class="m">~40,000 samples</span>
+</div>
+<p>Why split? The two halves are different problems. Text→mel is a <em>sequence</em>
+problem (durations, prosody, pronunciation). Mel→waveform is a <em>signal</em> problem
+(invert a lossy transform). Historically they advanced independently — Tacotron improved
+stage 1 while WaveNet/HiFi-GAN revolutionized stage 2 — and the interface between them is
+exactly the log-mel you built in Module 0. Modern systems (VITS, StyleTTS2 → Kokoro) fuse
+the stages end-to-end for quality, but you can't see <em>why</em> that helps until you've
+felt the seam.</p>
+
+<h2><span class="num">4.2</span>The acoustic model: attention decides time</h2>
+<p>ASR's alignment problem, inverted. CTC <em>discovered</em> the alignment hidden in the
+audio; TTS must <em>decide</em> one — how many frames is the "o" in "go"? Tacotron's answer:
+generate mel frames autoregressively, and at every step use <strong>attention over the
+text</strong> to know where you are:</p>
+<div class="diagram">
+ every decoder step (= r mel frames):
+   1  prenet(previous frame)            <span class="m">"what did I just say?"</span>
+   2  attention over encoder states     <span class="m">"which characters am I on?"   ← the core</span>
+   3  GRU state update                  <span class="m">"remember where I am"</span>
+   4  project [state, context] → r×80   <span class="m">"paint the next slice of mel"</span>
+   5  stop head → P(done)               <span class="m">"am I finished talking?"</span>
+</div>
+
+<h3>The four tricks that make it trainable (and what happened without them)</h3>
+<div class="tablewrap"><table>
+<tr><th>Trick</th><th>What it does</th><th>Observed in this repo</th></tr>
+<tr><td><strong>Teacher forcing</strong></td><td>during training, feed the <em>true</em> previous frame, not the model's own output — otherwise early training compounds its own garbage</td><td>standard; also the root of the exposure-bias problem in 4.3</td></tr>
+<tr><td><strong>Always-on prenet dropout</strong></td><td>the previous-frame path is so informative the decoder would copy-forward and ignore the text; dropout (kept on at inference, as in Tacotron 2) forces reliance on attention</td><td>without it: fluent mumble uncorrelated with text</td></tr>
+<tr><td><strong>Reduction factor r=2</strong></td><td>predict 2 frames per step: halves the sequence the attention must traverse and makes each step cover more audio</td><td>alignment forms noticeably faster</td></tr>
+<tr><td><strong>Location-sensitive attention</strong></td><td>feed the <em>previous</em> alignment through a conv into the scorer: "I was at char 12, look near 13" — a soft monotonicity hint</td><td>content-only attention stuttered and skipped</td></tr>
+</table></div>
+
+<h2><span class="num">4.3</span>The training story (including the failure)</h2>
+<p>This actually happened in this repo, and it's the most instructive part:</p>
+<ol>
+<li><strong>Attempt 1 — 3000 steps, no attention prior.</strong> Mel L1 fell smoothly
+0.81 → 0.24. Sounds like success — but the loss was lying. L1 falls early just by
+predicting <em>blurry average speech</em>. The free-running attention map was a smear;
+Whisper-as-judge heard one half-sentence correctly and nothing else; generation stopped at
+2.2 s on an 82-character sentence.</li>
+<li><strong>Diagnosis.</strong> With 19 training utterances the attention never had enough
+signal to discover "text is read left to right" on its own. And the loss curve can't tell
+you: <strong>for seq2seq TTS, watch the alignment map, not the loss.</strong></li>
+<li><strong>Attempt 2 — guided attention (DC-TTS trick).</strong> Add a penalty
+<code>mean(A·W)</code> where <code>W[t,n] = 1 − exp(−(n/N − t/T)²/2g²)</code>: attention
+mass far from the diagonal is taxed, near it is free. It's a <em>prior</em>, not a
+constraint — with enough data you'd drop it. Alignment then forms in hundreds of steps
+instead of never.</li>
+<li><strong>Exposure bias, managed.</strong> Even aligned, a teacher-forced model drifts
+when fed its own imperfect frames at inference — attention can stall on one character.
+We implemented stop-head guards (2 consecutive votes + ~5 frames/char minimum) and
+<em>measured</em> the popular harder hack — inference-time attention windowing — to be
+<strong>worse</strong> (judge CER 0.22 → 0.44 on the best sentence): the model was trained
+on full-softmax attention, and renormalizing inside a window feeds it context vectors it
+has never seen. Honest fixes live in training (more data, scheduled sampling) or in
+architectures that delete autoregression entirely (4.6).</li>
+<li><strong>Checkpoint selection by the judge.</strong> Free-running quality oscillates
+between checkpoints even while training loss is flat — so the training script transcribes
+its own synthesis with Whisper every 1000 steps and keeps the checkpoint with the best
+CER as <code>tts.pt</code>. "Last" is not "best" for generative models; select on the
+metric you actually care about.</li>
+</ol>
+<div class="callout warn">
+  <span class="label">Transferable lesson</span>
+  Generative models can achieve good training loss while being unusable, because the loss
+  measures frame-level regression, not the property you care about (intelligibility).
+  Always keep an end-to-end judge — we transcribe our own TTS output with Whisper and
+  compare CER against the input text. Production TTS teams do exactly this (ASR-based
+  intelligibility evals) alongside human MOS ratings.
+</div>
+
+<h2><span class="num">4.4</span>The stop token problem</h2>
+<p>The model must also decide <em>when to shut up</em> — a binary "am I done?" head per
+step. Subtle imbalance: padded batches make "done" frames outnumber "still talking" frames
+for short utterances, and one false positive truncates mid-word. Our guards: require 2
+consecutive stop votes AND ~5 frames per input character before stopping. (Kokoro-class
+models avoid this class of bug entirely by predicting all durations up front — see 4.6.)</p>
+
+<h2><span class="num">4.5</span>Griffin-Lim: recovering what Module 0 destroyed</h2>
+<p>The mel pipeline threw away two things; the vocoder must reinvent both:</p>
+<ul>
+<li><strong>Frequency detail</strong> — 257 FFT bins were pooled into 80 triangles.
+Least-squares undo: multiply by the filterbank's <strong>pseudo-inverse</strong>
+(<code>torch.linalg.pinv</code>) and clamp negatives.</li>
+<li><strong>Phase</strong> — the power spectrum kept |X|² and discarded every phase angle,
+but the inverse FFT needs complex numbers. Griffin-Lim (1984) exploits the redundancy of
+overlapping frames (400-sample frames, 160 hop → 60% overlap): iterate
+<em>ISTFT → STFT → keep our magnitude, adopt the re-measured phase</em>, and the phases are
+squeezed toward mutual consistency.</li>
+</ul>
+<p>Measured here: spectral convergence 0.235 → 0.112 over 60 iterations; gain-invariant
+mel MAE 0.22 on voiced frames. Listen to <code>outputs/07_roundtrip.wav</code>: intelligible,
+but robotic/"phasey" — the phase is <em>consistent</em>, not <em>true</em>. Also note our
+ISTFT is hand-built overlap-add with the synthesis-window normalization
+(<code>Σ w²</code> divisor) — the detail everyone gets wrong first.</p>
+<div class="callout">
+  <span class="label">Why neural vocoders exist</span>
+  That robotic residue is the entire reason for WaveNet (2016, autoregressive
+  sample-by-sample, glacial), WaveRNN, then GAN vocoders — <strong>HiFi-GAN</strong>
+  (2020) generates the waveform in one pass with a discriminator enforcing "sounds real",
+  runs faster than realtime on CPU, and is still the workhorse inside many production
+  stacks. Biggest single audio-quality jump in TTS history.
+</div>
+
+<h2><span class="num">4.6</span>From Tacotron to Kokoro: the modern lineage</h2>
+<div class="tablewrap"><table>
+<tr><th>Era</th><th>Model</th><th>The move</th></tr>
+<tr><td>2017</td><td>Tacotron 2</td><td>what you built, scaled: LSTM + location attention + WaveNet vocoder</td></tr>
+<tr><td>2019</td><td>FastSpeech 1/2</td><td><strong>kill autoregression</strong>: predict every phoneme's duration explicitly, upsample, generate all frames in parallel — no stop token, no stalls, 100× faster, at the cost of needing alignments from a teacher</td></tr>
+<tr><td>2021</td><td>VITS</td><td><strong>fuse the stages</strong>: text→waveform end-to-end (VAE + flows + GAN), learns alignment itself (MAS) — removes the mel seam entirely</td></tr>
+<tr><td>2023–24</td><td>StyleTTS 2</td><td>style diffusion + adversarial training with a speech-LM judge; human-level naturalness on LJSpeech</td></tr>
+<tr><td>2024–25</td><td><strong>Kokoro-82M</strong> (our prod engine)</td><td>StyleTTS2-derived recipe distilled to 82M params, ONNX, CPU-realtime — near-SOTA naturalness at hobbyist cost</td></tr>
+<tr><td>frontier</td><td>audio-LMs (VALL-E, Bark, CSM…)</td><td>treat speech as tokens (neural codecs) and let an LLM generate it; zero-shot voice cloning, expressive but heavier and less controllable</td></tr>
+</table></div>
+<p>Trace your model's two pain points through the table: the <em>stop/stall problems</em>
+die with explicit durations (FastSpeech), and the <em>Griffin-Lim robotic residue</em> dies
+with learned vocoders / end-to-end (HiFi-GAN, VITS). Every generation of TTS research is
+legible as "which of Tacotron's failure modes does this kill?" — which is exactly why
+building Tacotron first is the right way to learn this field.</p>
+
+<h2><span class="num">4.7</span>Streaming TTS in the pipeline</h2>
+<p>Both TTS engines yield audio <strong>per sentence</strong> (<code>synthesize()</code> is
+a generator): time-to-first-audio ≈ one sentence's synthesis, later sentences render while
+earlier ones play, and barge-in abandons the generator wasting at most one sentence.
+Production APIs stream at finer grain (chunked vocoding inside sentences, ~100 ms audio
+chunks) — same principle, smaller unit. This composes with LLM token streaming: cut the
+token stream at the first sentence boundary and start TTS while the LLM is still writing.</p>
+
+</main>
+<footer class="nav">
+  <a href="03-asr.html">← ASR</a>
+  <a href="05-production.html">Next: Production inference →</a>
+</footer>
+</body>
+</html>

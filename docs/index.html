@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Voice Agent From Scratch — Learning Hub</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>A Voice Agent <span>From Scratch</span></h1>
+  <p>Deep-dive documentation written alongside the code in this repo: every model,
+     every systems decision, and what production stacks do differently — recorded
+     while it was being built, including the failures.</p>
+</header>
+<main>
+
+<h2><span class="num">◈</span>The one-diagram summary</h2>
+<div class="diagram">
+ <span class="m">browser mic (AudioWorklet, 48 kHz float)</span>
+      │  resample to 16 kHz, int16, 32 ms frames
+      ▼  <span class="m">WebSocket binary frames</span>
+ ┌─────────────────────────── server (one session) ───────────────────────────┐
+ │                                                                             │
+ │  <span class="a">VAD</span> ─ per-window P(speech)     <span class="m">Module 1 VADNet │ prod: Silero v5</span>          │
+ │   │                                                                         │
+ │  <span class="a">ENDPOINTER</span> ─ turn detection    <span class="m">hysteresis + debounce + pre-roll</span>            │
+ │   │  utterance audio (one turn)                                             │
+ │  <span class="b">ASR</span> ─ audio → text             <span class="m">Module 2 CTC BiGRU │ prod: faster-whisper</span>   │
+ │   │  transcript                                                             │
+ │  <span class="c">RESPONDER</span> ─ text → reply       <span class="m">echo (slot for an LLM)</span>                      │
+ │   │  reply text, sentence by sentence                                       │
+ │  <span class="c">TTS</span> ─ text → audio             <span class="m">Module 4 Tacotron-mini │ prod: Kokoro</span>       │
+ │   │                                                                         │
+ │  <span class="g">ORCHESTRATOR</span> ─ the state machine that wires it all + <span class="w">BARGE-IN</span>              │
+ └─────────────────────────────────────────────────────────────────────────────┘
+      │  JSON events + TTS PCM
+      ▼
+ <span class="m">browser playback (flushed instantly when you interrupt)</span>
+</div>
+
+<h2><span class="num">01</span>The pages</h2>
+
+<div class="card">
+  <h3><a href="01-pipeline.html">1 · Pipeline architecture</a></h3>
+  <p>The real-time voice loop end to end: the wire protocol, the session state
+  machine, why barge-in dictates the entire threading model, latency budgets,
+  and the orchestration layer nobody's papers talk about.</p>
+</div>
+<div class="card">
+  <h3><a href="02-vad.html">2 · VAD deep dive</a></h3>
+  <p>Voice activity detection from your 55k-param conv net to Silero v5. Why VAD
+  and endpointing are different problems, hysteresis, pre-roll, and a real
+  domain-mismatch bug we hit (digital zeros vs. mic noise).</p>
+</div>
+<div class="card">
+  <h3><a href="03-asr.html">3 · ASR deep dive</a></h3>
+  <p>From your CTC BiGRU to Whisper: the alignment problem, CTC's blank trick,
+  prefix beam search, encoder-decoder ASR, streaming (RNN-T) vs utterance-based
+  recognition, and why inference engines (CTranslate2) exist.</p>
+</div>
+<div class="card">
+  <h3><a href="04-tts.html">4 · TTS deep dive</a></h3>
+  <p>Speech synthesis as ASR's mirror: Tacotron-style attention, the guided
+  attention fix that made our model align, stop tokens, Griffin-Lim phase
+  recovery by hand, and the neural-vocoder revolution up to Kokoro/VITS.</p>
+</div>
+<div class="card">
+  <h3><a href="05-production.html">5 · Production inference</a></h3>
+  <p>What turns models into a service: model loading and sharing, quantization,
+  the event-loop rule, p50/p95 latency, health checks, scaling out, telephony
+  realities (8 kHz, AEC), and what this repo deliberately simplifies.</p>
+</div>
+<div class="card">
+  <h3><a href="06-decisions.html">6 · Decision log (ADRs)</a></h3>
+  <p>Every significant choice made while building this, with the alternatives
+  considered, the reasoning, and measured evidence — including the failures
+  (MPS 13× slower than CPU here, attention collapse before guided attention).</p>
+</div>
+
+<h2><span class="num">02</span>How to use this repo to learn</h2>
+<ol>
+  <li><strong>Run modules 0–2</strong> (features, VAD, ASR) — each script prints/plots
+      what it learned. Read the source next to its output; every file's docstring
+      is a mini-lecture.</li>
+  <li><strong>Hear Module 4</strong>: <code>scripts/07_vocoder_roundtrip.py</code> (what mels throw away),
+      then <code>scripts/08_train_tts.py</code> and listen to <code>outputs/08_sample_step*.wav</code>
+      go from noise → mumble → speech while <code>08_alignment.png</code> forms a diagonal.</li>
+  <li><strong>Run the agent</strong>: <code>uv run python -m server.app</code>, open
+      <code>http://127.0.0.1:8000</code>, talk, interrupt it mid-reply.</li>
+  <li><strong>A/B yourself vs production</strong>: same mic audio, swap one engine at a time —
+      <code>VOICE_ASR_ENGINE=whisper</code>, then compare <code>/metrics</code> and transcript quality.
+      The gap you hear <em>is</em> the content of pages 2–4.</li>
+</ol>
+
+<div class="callout prod">
+  <span class="label">The honest answer to "is this how production looks?"</span>
+  The <em>algorithms</em> in modules 0–4 are the real ones — the same math runs inside
+  Silero, Whisper and Kokoro. What production does differently: pretrained weights from
+  enormous data (that's pages 2–4), purpose-built inference runtimes, and a lot of
+  systems engineering around turn-taking and latency (pages 1 and 5 — which this repo
+  <em>does</em> implement for real).
+</div>
+
+</main>
+</body>
+</html>

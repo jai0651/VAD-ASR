@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>6 · Decision Log — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>Decision <span>Log</span></h1>
+  <p>Every significant choice, ADR-style: the context, the alternatives, why, and what
+     production does instead. Includes the failures and the measurements — decisions
+     without evidence are just opinions.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← hub</a></div>
+
+<h2><span class="num">D1</span>From-scratch models are the default; production engines are config-switchable</h2>
+<div class="card">
+<p><strong>Context:</strong> the repo's purpose is learning, but the original question was
+"is this how production looks?" — which requires having the production stack to compare against.</p>
+<p><strong>Decision:</strong> every pipeline slot defaults to the model built in this repo
+(<code>VOICE_*_ENGINE=scratch</code>); Silero/faster-whisper/Kokoro are one env var away,
+framed explicitly as "in production, use this instead".</p>
+<p><strong>Alternatives:</strong> pretrained-only (fast but you learn glue, not speech);
+scratch-only (no calibration against reality).</p>
+<p><strong>Why:</strong> the A/B on identical mic audio <em>is</em> the curriculum — the
+quality gap you hear is the data/architecture content of docs 2–4 made audible.</p>
+</div>
+
+<h2><span class="num">D2</span>Endpointing is a separate layer from VAD</h2>
+<div class="card">
+<p><strong>Decision:</strong> VAD emits per-window P(speech); a pure-logic state machine
+(<code>endpointing.py</code>) owns turn detection: debounce, hysteresis, pre-roll,
+silence timeout, min/max utterance bounds.</p>
+<p><strong>Alternatives:</strong> Silero's bundled utterance iterator (hides the policy —
+the opposite of instructive); thresholding VAD directly in the orchestrator (untestable,
+untunable).</p>
+<p><strong>Why:</strong> the policy layer is where every real deployment tunes UX
+(<code>end_silence_ms</code> is the single most user-visible number in the system), and
+pure logic means the entire behavior is unit-tested without models
+(<code>tests/test_endpointing.py</code>).</p>
+<p><strong>Production counterpart:</strong> identical structure; the frontier replaces the
+fixed silence timeout with semantic turn detection.</p>
+</div>
+
+<h2><span class="num">D3</span>Utterance-based ASR (transcribe on endpoint), not streaming partials</h2>
+<div class="card">
+<p><strong>Decision:</strong> ASR runs once per closed turn on the full utterance.</p>
+<p><strong>Alternatives:</strong> chunked pseudo-streaming Whisper (complex, hacky
+context management); RNN-T for true streaming (a different, bigger model family).</p>
+<p><strong>Why:</strong> at RTF 0.08 the whole turn transcribes inside the endpoint wait
+that exists anyway; this is also what most open production agents (pipecat/LiveKit
+examples) ship. Streaming partials are documented as the extension (docs 3.4), needed for
+live captions and semantic endpointing.</p>
+</div>
+
+<h2><span class="num">D4</span>Barge-in via task cancellation + client-side buffer flush</h2>
+<div class="card">
+<p><strong>Decision:</strong> the whole reply (ASR→respond→TTS) is one asyncio task;
+confirmed speech during THINKING/SPEAKING cancels it and sends <code>interrupted</code>
+so the client drops queued audio.</p>
+<p><strong>Why one task:</strong> cancellation semantics come for free and cleanup is
+structural. <strong>Why the client flush matters:</strong> cancelling the producer doesn't
+empty the consumer's buffer — without the flush the agent audibly "keeps talking" after
+being interrupted.</p>
+<p><strong>Consequence accepted:</strong> a sentence already inside a worker thread finishes
+computing (wasted compute, bounded by one sentence) — Python threads can't be safely killed
+mid-kernel.</p>
+</div>
+
+<h2><span class="num">D5</span>ASR/TTS in worker threads; VAD inline on the event loop</h2>
+<div class="card">
+<p><strong>Decision:</strong> blocking model calls go through <code>asyncio.to_thread</code>;
+VAD (&lt;1 ms/window) runs inline.</p>
+<p><strong>Why:</strong> the receive loop must keep draining mic frames during a 300 ms+
+transcription or barge-in is physically impossible (the agent is deaf while busy). Threads
+suffice because PyTorch/CTranslate2 release the GIL inside kernels.</p>
+<p><strong>Production counterpart:</strong> the same seam, scaled: threads → bounded worker
+pools → RPC to batching GPU services (docs 5.4).</p>
+</div>
+
+<h2><span class="num">D6</span>Wire protocol: raw PCM16 binary frames + JSON text events over one WebSocket</h2>
+<div class="card">
+<p><strong>Alternatives:</strong> WebRTC (production-grade transport with AEC/jitter
+handling, but an order of magnitude more moving parts); Opus encoding (bandwidth win,
+irrelevant on localhost); base64-in-JSON (33% overhead for nothing — though notably it's
+what telephony media-stream APIs do for compatibility).</p>
+<p><strong>Why:</strong> binary/text frame separation is idiomatic WebSocket, trivially
+debuggable, and structurally identical to commercial realtime voice APIs — the learning
+transfers.</p>
+</div>
+
+<h2><span class="num">D7</span>Engines are structural interfaces; weights shared per process, state per session</h2>
+<div class="card">
+<p><strong>Decision:</strong> <code>push / transcribe / synthesize / respond</code> duck-typed
+interfaces; ASR/TTS constructed once in the lifespan hook, VAD+endpointer+orchestrator per
+connection.</p>
+<p><strong>Why:</strong> (a) conversation policy becomes unit-testable with fakes — the
+barge-in test runs in milliseconds with zero downloads; (b) "weights are shared, state is
+not" is <em>the</em> serving invariant worth internalizing; (c) the interface seam is where
+RPC goes when scaling out.</p>
+</div>
+
+<h2><span class="num">D8</span>TTS is a per-sentence generator everywhere</h2>
+<div class="card">
+<p><strong>Decision:</strong> <code>synthesize(text)</code> yields audio sentence by sentence
+in both engines.</p>
+<p><strong>Why:</strong> time-to-first-audio ≈ sentence one (measured: Kokoro ~1.1 s for
+sentence 1 of a 5.3 s reply); barge-in wastes at most one sentence; and it composes with a
+future streaming LLM (cut at first sentence boundary). Latency by pipelining, not by
+faster models.</p>
+</div>
+
+<h2><span class="num">D9</span>The "brain" is a Responder protocol; echo default, Claude one env var away</h2>
+<div class="card">
+<p><strong>Why echo default:</strong> the repo teaches speech, not prompting; echo closes
+the loop with zero API keys and keeps every test hermetic.</p>
+<p><strong>The LLM swap, implemented:</strong> <code>VOICE_RESPONDER=claude</code> activates
+<code>ClaudeResponder</code> — a real conversational brain with per-session history
+(which is why responders are built per connection, like VADs: history is state, and
+state is never shared between users). Barge-in composes for free: the reply task that
+gets cancelled now simply contains an LLM call.</p>
+<p><strong>Production nuance recorded, not implemented:</strong> we make one blocking LLM
+call per turn. Real agents stream tokens and cut at the first sentence boundary so TTS
+starts while the LLM is still writing — LLM time-to-first-token dominates the reply
+budget, and that overlap wins back several hundred ms.</p>
+</div>
+
+<h2><span class="num">D10</span>TTS from scratch = Tacotron-mini + Griffin-Lim, single speaker, deliberately overfit</h2>
+<div class="card">
+<p><strong>Alternatives considered:</strong> FastSpeech-style (needs external alignments —
+a second dependency to teach); VITS-style end-to-end (adversarial training, too heavy for
+a laptop CPU and too entangled to dissect); concatenative/formant synthesis (instructive
+DSP but a dead end pedagogically).</p>
+<p><strong>Why Tacotron:</strong> it exposes the three concepts the whole field is built on
+(attention-decides-durations, stop tokens, the mel↔waveform seam), trains to
+intelligibility on one speaker's ~2 minutes in ~20 CPU-minutes, and its failure modes are
+the exact motivations for FastSpeech/VITS/Kokoro (docs 4.6).</p>
+<p><strong>Why Griffin-Lim:</strong> zero-training inverse of Module 0 — the only vocoder
+whose every line you can derive. The audible robotic residue is the lesson.</p>
+</div>
+
+<h2><span class="num">D11</span>Guided attention penalty added after measured failure</h2>
+<div class="card">
+<p><strong>Evidence:</strong> attempt 1 (no prior, 3000 steps): mel L1 0.81→0.24 yet
+free-running attention smeared; generation stopped at 2.2 s on an 82-char sentence;
+Whisper-as-judge CER ≈ 0.4–1.0 across seen sentences.</p>
+<p><strong>Decision:</strong> add DC-TTS guided attention
+(<code>W[t,n]=1−exp(−(n/N−t/T)²/2g²)</code>, weight 5.0) + stop-head guards (2 consecutive
+votes, ~5 frames/char minimum) at inference.</p>
+<p><strong>Lesson recorded:</strong> for seq2seq TTS, the loss curve is not the health
+metric — the alignment map is; and keep an end-to-end judge (transcribe your own TTS with
+a strong ASR).</p>
+</div>
+
+<h2><span class="num">D11b</span>Decode-time attention windowing: tried, measured, rejected</h2>
+<div class="card">
+<p><strong>Context:</strong> free-running attention sometimes stalls on a character
+(exposure bias), so we tried the classic deployed-Tacotron hack: hard-mask attention to a
+window around its current position, with forced advance on stall.</p>
+<p><strong>Evidence:</strong> ASR-judge CER got <em>worse</em> (best sentence 0.22 → 0.44;
+a stall-rescue variant collapsed several sentences to unintelligible 10 s runs). Cause:
+the model was trained with full-softmax attention; a renormalized window produces context
+vectors from a distribution it never saw.</p>
+<p><strong>Decision:</strong> keep decoding faithful to training (stop-head guards only);
+attack exposure bias where it lives — training data, scheduled sampling, or
+non-autoregressive architectures.</p>
+<p><strong>Lesson recorded:</strong> measure your "obvious fix" against a judge before
+shipping it; inference-time hacks that change the input distribution can subtract value.</p>
+</div>
+
+<h2><span class="num">D11c</span>Checkpoint selection by ASR judge, not by loss or recency</h2>
+<div class="card">
+<p><strong>Decision:</strong> every 1000 steps the training script synthesizes 4 seen
+sentences, transcribes them with whisper, and promotes the checkpoint to
+<code>tts.pt</code> only if mean CER improved (<code>tts_last.pt</code> keeps the latest).</p>
+<p><strong>Why:</strong> free-running intelligibility oscillates between checkpoints while
+teacher-forced loss stays flat — the loss can't see exposure bias. Selecting on an
+end-to-end judged metric is standard production practice (same idea as picking LLM
+checkpoints by eval win-rate, not perplexity).</p>
+<p><strong>Evidence (final 10k-step run, 29 utterances):</strong> judge CER by step:
+1000→0.96, 2000→0.80, <em>3000→1.01</em>, 4000→0.75, 6000→0.63, <em>7000→0.78</em>,
+<strong>8000→0.61 (kept)</strong>, <em>9000→0.73</em>, 10000→0.66. Three regressions after
+new bests — "take the last checkpoint" would have shipped 0.66 instead of 0.61, and a
+shorter run without selection could have shipped 1.01.</p>
+</div>
+
+<h2><span class="num">D12</span>TTS training runs on CPU by default, not MPS</h2>
+<div class="card">
+<p><strong>Evidence:</strong> measured 0.24 it/s on Apple MPS vs 3.2–4.6 it/s on CPU —
+CPU ~13× faster for this model.</p>
+<p><strong>Why:</strong> the decoder is a Python loop of tiny matmuls; every op pays GPU
+dispatch overhead that dwarfs the math. GPUs win on large parallel batches, not long
+sequential chains of small ops. (The batched conv/GRU training of Modules 1–2 <em>does</em>
+benefit from MPS — the difference between the two cases is the lesson.)</p>
+</div>
+
+<h2><span class="num">D13</span>E2E test pads with mic-like noise, not digital zeros</h2>
+<div class="card">
+<p><strong>Evidence:</strong> scratch VAD on exact zeros: mean P(speech)=0.335, flickering
+(the training generator always had a noise floor → zeros are out-of-distribution); on
+σ=0.005 noise: 0.004, rock-solid.</p>
+<p><strong>Decision:</strong> the test simulates reality (mics always have a noise floor)
+rather than retraining the model for an input real serving never produces.</p>
+<p><strong>Lesson recorded:</strong> train/serve skew fails silently; keep input-hygiene
+tests (docs 2.5).</p>
+</div>
+
+<h2><span class="num">D14</span>Whisper's own VAD filter and text-conditioning are OFF</h2>
+<div class="card">
+<p><strong>Why:</strong> our endpointer already trims silence — a second VAD adds latency
+and a second opinion to debug; <code>condition_on_previous_text=False</code> because
+utterances are independent turns and conditioning compounds hallucinations across turns.
+General principle: when you own a pipeline stage, disable the model's internal duplicate.</p>
+</div>
+
+<h2><span class="num">D15</span>Metrics: in-process rolling p50/p95 per stage, JSON endpoint</h2>
+<div class="card">
+<p><strong>Alternatives:</strong> full Prometheus + Grafana (right for prod, noise for
+learning); nothing (flying blind).</p>
+<p><strong>Why:</strong> the decomposition (asr_ms, tts_sentence_ms, turnaround_ms,
+barge_ins, discards) is the part that transfers; percentiles-not-averages is the habit
+worth forming. Bounded deques so memory can't creep.</p>
+</div>
+
+<h2><span class="num">D16</span>uv + pydantic-settings + pytest as the engineering baseline</h2>
+<div class="card">
+<p><strong>Why:</strong> locked reproducible env (<code>uv.lock</code>), every tunable in
+one typed object overridable by <code>VOICE_*</code> env vars (no constants buried in model
+files), and the policy layers covered by fast hermetic tests. Minimal, but it's the
+skeleton production code hangs on.</p>
+</div>
+
+</main>
+<footer class="nav">
+  <a href="05-production.html">← Production</a>
+  <a href="index.html">Hub ↺</a>
+</footer>
+</body>
+</html>

@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Real-Time VAD + ASR — Architecture & Study Guide</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --bg-soft: #121826;
+    --card: #161d2e;
+    --card-2: #1b2436;
+    --line: #273249;
+    --text: #e6ebf4;
+    --muted: #9aa7bd;
+    --accent: #5eead4;     /* teal */
+    --accent-2: #8b9cff;   /* indigo */
+    --accent-3: #f0abfc;   /* pink */
+    --warn: #fbbf24;
+    --green: #34d399;
+    --red: #fb7185;
+    --radius: 14px;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--sans); line-height: 1.65; font-size: 16px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); background: #0e1422; padding: 2px 6px;
+    border-radius: 6px; font-size: 0.88em; color: #cdd7ea; border: 1px solid var(--line);}
+
+  /* ---- layout ---- */
+  header.hero {
+    padding: 64px 24px 48px; text-align: center;
+    background: radial-gradient(1200px 500px at 50% -10%, rgba(94,234,212,.14), transparent 60%),
+                radial-gradient(900px 400px at 80% 0%, rgba(139,156,255,.12), transparent 55%);
+    border-bottom: 1px solid var(--line);
+  }
+  .hero h1 { font-size: clamp(28px, 5vw, 46px); margin: 0 0 10px; letter-spacing: -.5px;}
+  .hero h1 span { background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .hero p { color: var(--muted); max-width: 760px; margin: 0 auto; font-size: 18px;}
+  .tagrow { margin-top: 22px; display:flex; gap:10px; justify-content:center; flex-wrap:wrap;}
+  .tag { font-size: 13px; color: var(--muted); border:1px solid var(--line);
+    padding: 6px 12px; border-radius: 999px; background: var(--bg-soft);}
+
+  nav.toc {
+    position: sticky; top: 0; z-index: 20; display:flex; gap: 4px; flex-wrap: wrap;
+    justify-content: center; padding: 12px; background: rgba(11,15,23,.85);
+    backdrop-filter: blur(10px); border-bottom: 1px solid var(--line);
+  }
+  nav.toc a { color: var(--muted); padding: 7px 14px; border-radius: 999px; font-size: 14px;}
+  nav.toc a:hover { color: var(--text); background: var(--card); text-decoration: none;}
+
+  main { max-width: 1080px; margin: 0 auto; padding: 8px 22px 80px; }
+  section { padding: 54px 0 8px; border-bottom: 1px dashed var(--line); }
+  section:last-child { border-bottom: none; }
+  h2 { font-size: 28px; margin: 0 0 6px; letter-spacing: -.4px; }
+  h2 .num { color: var(--accent); font-family: var(--mono); font-size: 20px; margin-right: 10px;}
+  h3 { font-size: 19px; margin: 30px 0 10px; color: #f4f7fc;}
+  .lead { color: var(--muted); margin: 4px 0 18px; max-width: 850px; }
+
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 20px 22px; margin: 16px 0; }
+  .grid { display:grid; gap: 16px; }
+  .grid.two { grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); }
+  .grid.three { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+
+  /* ---- pipeline diagram ---- */
+  .flow { display:flex; align-items:stretch; gap:0; flex-wrap:wrap; margin: 18px 0;}
+  .node { flex:1 1 150px; min-width: 150px; background: var(--card-2); border:1px solid var(--line);
+    border-radius: 12px; padding: 14px; text-align:center; position: relative;}
+  .node .ic { font-size: 22px; }
+  .node b { display:block; margin-top: 4px; font-size: 15px;}
+  .node small { color: var(--muted); display:block; font-size: 12.5px; margin-top: 3px;}
+  .arrow { align-self:center; color: var(--accent); font-size: 24px; padding: 0 6px; }
+  .node.accent { border-color: rgba(94,234,212,.5); box-shadow: 0 0 0 1px rgba(94,234,212,.15) inset;}
+  .node.warn { border-color: rgba(251,191,36,.45);}
+
+  table { width:100%; border-collapse: collapse; margin: 14px 0; font-size: 14.5px;}
+  th, td { text-align:left; padding: 11px 12px; border-bottom: 1px solid var(--line); vertical-align: top;}
+  th { color: var(--accent-2); font-weight: 600; background: var(--bg-soft);}
+  tr:hover td { background: rgba(255,255,255,.02); }
+  .pick { color: var(--green); font-weight:600; }
+
+  .callout { border-left: 3px solid var(--accent); background: var(--bg-soft);
+    padding: 12px 16px; border-radius: 0 10px 10px 0; margin: 14px 0; color: #d7deec;}
+  .callout.warn { border-left-color: var(--warn); }
+  .callout.note { border-left-color: var(--accent-2); }
+
+  .pill { display:inline-block; font-size:12px; font-family:var(--mono); padding:2px 8px;
+    border-radius:6px; border:1px solid var(--line); color:var(--muted); margin-right:6px;}
+
+  figure { margin: 16px 0; }
+  figure img { width:100%; border-radius: 12px; border:1px solid var(--line); display:block;}
+  figcaption { color: var(--muted); font-size: 13px; margin-top: 8px; text-align:center;}
+
+  .layer { font-family: var(--mono); font-size: 13.5px; background:#0e1422; border:1px solid var(--line);
+    border-radius:10px; padding: 14px 16px; overflow-x:auto; color:#cdd7ea;}
+  .layer .c { color: var(--accent); }
+  .layer .d { color: var(--muted); }
+
+  ul.clean { list-style:none; padding-left: 0; margin: 8px 0;}
+  ul.clean li { padding: 7px 0 7px 26px; position: relative; border-bottom: 1px solid var(--line);}
+  ul.clean li:before { content:"▸"; color: var(--accent); position:absolute; left:4px;}
+  ul.clean li:last-child { border-bottom: none; }
+
+  .res-group h3 { display:flex; align-items:center; gap:10px;}
+  .badge { font-size:11px; padding:3px 9px; border-radius:999px; font-family:var(--mono);}
+  .b-book { background: rgba(52,211,153,.15); color: var(--green); border:1px solid rgba(52,211,153,.3);}
+  .b-paper{ background: rgba(139,156,255,.15); color: var(--accent-2); border:1px solid rgba(139,156,255,.3);}
+  .b-video{ background: rgba(240,171,252,.13); color: var(--accent-3); border:1px solid rgba(240,171,252,.3);}
+  .b-course{background: rgba(251,191,36,.13); color: var(--warn); border:1px solid rgba(251,191,36,.3);}
+  .res li small { color: var(--muted); display:block; }
+
+  .star { color: var(--warn); }
+  footer { text-align:center; color: var(--muted); padding: 40px 20px; font-size: 14px;}
+  .map-line { font-family: var(--mono); font-size: 13px; color: var(--muted);}
+  .map-line b { color: var(--text); }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <h1>Real-Time <span>VAD + ASR</span> Pipeline</h1>
+  <p>The production architecture for the streaming transcription problem — plus the
+     detailed internals of the Voice Activity Detection and Speech Recognition models
+     you built from scratch, and a deep study guide.</p>
+  <div class="tagrow">
+    <span class="tag">WebSocket Gateway</span>
+    <span class="tag">Queue / Workers</span>
+    <span class="tag">Backpressure</span>
+    <span class="tag">Log-Mel Features</span>
+    <span class="tag">CTC ASR</span>
+    <span class="tag">Study Resources</span>
+  </div>
+</header>
+
+<nav class="toc">
+  <a href="#system">① System Design</a>
+  <a href="#features">② Features</a>
+  <a href="#vad">③ VAD</a>
+  <a href="#asr">④ ASR (CTC)</a>
+  <a href="#connect">⑤ Putting It Together</a>
+  <a href="#resources">⑥ Resources</a>
+</nav>
+
+<main>
+
+<!-- ============================ SYSTEM DESIGN ============================ -->
+<section id="system">
+  <h2><span class="num">01</span>The Production System</h2>
+  <p class="lead">The original challenge: thousands of users stream audio over WebSockets;
+     you must run VAD → ASR and stream text back, at low latency, without the gateway
+     freezing or the GPU workers running out of memory.</p>
+
+  <h3>End-to-end data flow</h3>
+  <div class="flow">
+    <div class="node accent"><div class="ic">🎙️</div><b>Client</b><small>mic → 16kHz PCM chunks over WS</small></div>
+    <div class="arrow">→</div>
+    <div class="node accent"><div class="ic">⚡</div><b>Async Gateway</b><small>FastAPI / asyncio — no ML here</small></div>
+    <div class="arrow">→</div>
+    <div class="node"><div class="ic">📨</div><b>Audio Queue</b><small>Redis Streams (bounded)</small></div>
+    <div class="arrow">→</div>
+    <div class="node"><div class="ic">🔊</div><b>VAD Worker</b><small>cheap CPU gate</small></div>
+    <div class="arrow">→</div>
+    <div class="node warn"><div class="ic">🧠</div><b>ASR Worker</b><small>GPU, dynamic batching</small></div>
+    <div class="arrow">→</div>
+    <div class="node accent"><div class="ic">💬</div><b>Results</b><small>text → WS by session_id</small></div>
+  </div>
+  <div class="callout note"><b>The golden rule:</b> the event loop must never run a blocking/CPU-heavy
+    call. The gateway only moves bytes; all inference happens in separate worker processes.
+    A thread won't save you — Python's GIL means CPU work in a thread still stalls the loop.</div>
+
+  <h3>1 · Connection Management &amp; Concurrency</h3>
+  <table>
+    <tr><th>Question</th><th>Choice</th><th>Why</th></tr>
+    <tr><td>WebSocket framework</td><td class="pick">FastAPI + Uvicorn (ASGI / asyncio)</td>
+        <td>WebSockets are I/O-bound; an async event loop holds thousands of idle connections
+            cheaply (one coroutine each, not one thread each).</td></tr>
+    <tr><td>Keep ML off the loop</td><td class="pick">Separate worker processes</td>
+        <td>Inference is CPU/GPU-bound. Run it in its own process; gateway communicates via a queue
+            and <code>await</code>s results.</td></tr>
+    <tr><td>Scale beyond one core</td><td class="pick">Multiple gateway workers + worker pool</td>
+        <td>Uvicorn workers for the gateway; an autoscaled pool of GPU workers behind the queue.</td></tr>
+  </table>
+
+  <h3>2 · Worker Architecture &amp; Data Flow</h3>
+  <table>
+    <tr><th>Mechanism</th><th>When to use</th><th>Verdict</th></tr>
+    <tr><td><code>asyncio.Queue</code> / <code>multiprocessing.Queue</code></td>
+        <td>Single node, prototype</td><td>Start here. Zero infra.</td></tr>
+    <tr><td><b>Redis Streams</b></td><td>Multi-process / few nodes, low latency</td>
+        <td class="pick">Default pick — ephemeral data, consumer groups, visible queue depth for backpressure.</td></tr>
+    <tr><td>Kafka</td><td>Massive scale, durability/replay</td>
+        <td>Overkill &amp; adds latency for ephemeral live audio. Name it, don't pick it.</td></tr>
+    <tr><td>Ray</td><td>Python-native distributed actors + GPU scheduling</td>
+        <td>Great if already Ray-native.</td></tr>
+  </table>
+  <div class="callout"><b>Why VAD before ASR:</b> VAD is cheap (CPU, ~1&nbsp;ms/frame) and filters out
+    silence/pauses, which dominate real conversations. Gating ASR behind VAD can cut expensive GPU
+    work by 50–80%. ASR workers then <b>batch</b> many users' speech segments into one GPU forward pass.</div>
+
+  <h3>3 · Backpressure &amp; OOM Mitigation</h3>
+  <div class="grid two">
+    <div class="card"><h3 style="margin-top:0">Bounded everything</h3>
+      <ul class="clean">
+        <li>Inbound queue has a <code>maxsize</code> — never unbounded (that's the road to OOM).</li>
+        <li>When full: <b>drop the oldest audio</b> (a 5s-old chunk is worthless for live transcription).</li>
+        <li>Or stop reading the socket → TCP flow control slows the sender naturally.</li>
+      </ul>
+    </div>
+    <div class="card"><h3 style="margin-top:0">Shed &amp; scale</h3>
+      <ul class="clean">
+        <li><b>Load-shed at the door:</b> reject new sessions (503 / close WS) past a global queue-depth threshold.</li>
+        <li><b>Autoscale GPU workers</b> on observed queue depth.</li>
+        <li><b>Dynamic batching</b> with max batch size + max wait → caps memory per step.</li>
+        <li>Cap concurrent sessions per worker; monitor VRAM/RSS and shed <i>before</i> the limit.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="callout warn"><b>One-line summary:</b> Bounded everything, drop stale audio, shed load at the
+    door, scale workers on queue depth. <b>Latency over completeness</b> for live audio.</div>
+</section>
+
+<!-- ============================ FEATURES ============================ -->
+<section id="features">
+  <h2><span class="num">02</span>Audio → Features (shared front-end)</h2>
+  <p class="lead">Both VAD and ASR consume the same input: a <b>log-mel spectrogram</b>. A raw waveform is
+     hard to learn from; the spectrogram exposes which frequencies have energy over time, warped to match
+     human hearing.</p>
+
+  <div class="flow">
+    <div class="node"><b>Waveform</b><small>16kHz mono PCM</small></div><div class="arrow">→</div>
+    <div class="node"><b>Framing</b><small>25ms frame / 10ms hop + Hann window</small></div><div class="arrow">→</div>
+    <div class="node"><b>FFT</b><small>power spectrum per frame</small></div><div class="arrow">→</div>
+    <div class="node"><b>Mel filterbank</b><small>80 triangular bands</small></div><div class="arrow">→</div>
+    <div class="node accent"><b>log</b><small>(T, 80) log-mel</small></div>
+  </div>
+
+  <figure>
+    <img src="outputs/00_features.png" alt="Waveform vs log-mel spectrogram" />
+    <figcaption>What the model sees: silence is dark; tones, a frequency sweep, and stacked harmonics
+      are clearly structured. <span class="map-line">built in <b>src/audio/features.py</b></span></figcaption>
+  </figure>
+
+  <div class="grid three">
+    <div class="card"><b>Framing + Hann</b><br><small class="map-line">25ms windows overlap by 15ms; Hann tapering kills spectral leakage at frame edges.</small></div>
+    <div class="card"><b>Mel scale</b><br><small class="map-line">Linear &lt;1kHz, log above — we resolve low frequencies far better than high.</small></div>
+    <div class="card"><b>log compression</b><br><small class="map-line">Squashes audio's huge dynamic range; matches roughly-logarithmic loudness perception.</small></div>
+  </div>
+  <p class="map-line">Frame rate = 1000/hop_ms = <b>100 frames/second</b>. This is the time resolution the
+     models operate on.</p>
+</section>
+
+<!-- ============================ VAD ============================ -->
+<section id="vad">
+  <h2><span class="num">03</span>VAD Architecture — "is this frame speech?"</h2>
+  <p class="lead">A lightweight frame-level binary classifier. It runs first as a cheap gate so expensive
+     ASR only sees actual speech.</p>
+
+  <h3>Model (frame-level conv classifier)</h3>
+  <div class="layer">
+input <span class="d">log-mel</span> (B, T, 80)
+  → transpose → (B, 80, T)
+  → <span class="c">Conv1d</span>(80→64, k=5, pad=2) → BatchNorm → ReLU
+  → <span class="c">Conv1d</span>(64→64, k=5, pad=2) → BatchNorm → ReLU
+  → <span class="c">Conv1d</span>(64→64, k=5, pad=2) → BatchNorm → ReLU
+  → <span class="c">Conv1d</span>(64→1, k=1)        <span class="d"># per-frame logit</span>
+output <span class="d">P(speech)</span> per frame → (B, T)
+  </div>
+  <div class="callout"><b>Why conv-over-time?</b> Speech has temporal continuity — a frame is far more likely
+     to be speech if its neighbors are. Convolutions give each output frame a window of context (its
+     receptive field ≈ 13 frames here), the single most useful prior for VAD. <span class="map-line">→ src/vad/model.py</span></div>
+
+  <div class="grid two">
+    <div class="card">
+      <h3 style="margin-top:0">Training</h3>
+      <ul class="clean">
+        <li><span class="pill">loss</span> masked Binary Cross-Entropy (ignore padded frames)</li>
+        <li><span class="pill">labels</span> per-frame 0/1 from synthetic speech vs noise/silence</li>
+        <li><span class="pill">result</span> ~100% frame accuracy on held-out audio</li>
+      </ul>
+      <span class="map-line">→ src/vad/data.py · scripts/01_train_vad.py</span>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Streaming inference</h3>
+      <ul class="clean">
+        <li><b>Context buffer:</b> keep recent frames so each new frame gets training-like context.</li>
+        <li><b>Look-ahead</b> = sharper boundaries but more latency (the core streaming trade-off).</li>
+        <li><b>Hysteresis gate:</b> enter speech above 0.6, leave below 0.4, with min-duration debouncing.</li>
+      </ul>
+      <span class="map-line">→ src/vad/stream.py · scripts/02_vad_stream.py</span>
+    </div>
+  </div>
+
+  <div class="grid two">
+    <figure><img src="outputs/01_vad_predictions.png" alt="VAD predictions vs truth" />
+      <figcaption>Prediction tracks ground-truth speech on unseen audio.</figcaption></figure>
+    <figure><img src="outputs/02_vad_stream.png" alt="Streaming VAD smoothing" />
+      <figcaption>Raw probability jitters (red); hysteresis keeps the decision stable (navy).</figcaption></figure>
+  </div>
+</section>
+
+<!-- ============================ ASR ============================ -->
+<section id="asr">
+  <h2><span class="num">04</span>ASR Architecture — CTC speech recognition</h2>
+  <p class="lead">Maps audio → text at the character level. The hard part is <b>alignment</b>: hundreds of
+     audio frames, only a handful of characters, and no per-frame labels. <b>CTC</b> solves it.</p>
+
+  <h3>The alignment problem &amp; the blank</h3>
+  <div class="card">
+    <p style="margin-top:0">The network emits one symbol <i>per frame</i> over {characters + <b>blank</b>}.
+       A deterministic <b>collapse</b> turns that frame-string into text:</p>
+    <div class="layer">
+<span class="d">1) merge repeats:</span>  "c c a a a t"   → "c a t"
+<span class="d">2) drop blanks:</span>   "c _ a _ t"     → "c a t"     (_ = blank)
+
+<span class="d">blank separates true repeats:</span>
+   "h e l l o"     → "h e l o"   ✗  (the two l's merge!)
+   "h e l _ l o"   → "h e l l o" ✓  (blank keeps them apart)
+    </div>
+    <p style="margin-bottom:0">CTC training sums the probability of <b>every</b> frame-path that collapses to the
+       target, so the model discovers its own alignment — you never label which frame is which letter.</p>
+  </div>
+
+  <h3>Model (conv front-end + BiGRU encoder)</h3>
+  <div class="layer">
+input <span class="d">log-mel</span> (B, T, 80)
+  → <span class="c">Conv1d</span>(80→H, k=5, s=1) → BN → ReLU
+  → <span class="c">Conv1d</span>(H→H, k=5, s=2) → BN → ReLU      <span class="d"># ×2 time downsample</span>
+  → <span class="c">BiGRU</span>(H → H, 2 layers, bidirectional)    <span class="d"># context both directions</span>
+  → <span class="c">Linear</span>(2H → vocab)                       <span class="d"># 27 chars + blank</span>
+  → <span class="c">log_softmax</span>
+output (B, T', vocab) → <span class="c">CTCLoss</span> / decoders
+  </div>
+  <div class="callout note"><b>Why this shape:</b> conv learns local time-frequency patterns and halves the
+     frame rate (adjacent frames are redundant); the bidirectional GRU mixes context across the whole
+     utterance so each label can depend on what comes before <i>and</i> after. <span class="map-line">→ src/asr/model.py</span></div>
+
+  <div class="grid two">
+    <div class="card"><h3 style="margin-top:0">Decoding</h3>
+      <ul class="clean">
+        <li><b>Greedy:</b> argmax per frame → collapse. Fast; commits to one alignment.</li>
+        <li><b>Prefix beam search:</b> sums probability over paths; tracks blank vs non-blank endings to handle repeats. Better on noisy/real audio.</li>
+        <li>Production adds a <b>language model</b> fused into the beam.</li>
+      </ul>
+      <span class="map-line">→ src/asr/decode.py</span>
+    </div>
+    <div class="card"><h3 style="margin-top:0">Results</h3>
+      <ul class="clean">
+        <li><b>Synthetic data:</b> 0% character error rate (incl. double letters).</li>
+        <li><b>Real LibriSpeech (seen):</b> 0% CER — transcribes real speech.</li>
+        <li><b>Real (held-out, tiny subset):</b> ~67% CER — the data-hunger gap.</li>
+      </ul>
+      <span class="map-line">→ scripts/04_train_asr.py · scripts/05_train_asr_libri.py</span>
+    </div>
+  </div>
+
+  <figure><img src="outputs/04_asr_emissions.png" alt="Peaky CTC emissions" />
+    <figcaption>CTC's signature "peaky" emissions: mostly blank, with a confident spike per character —
+      note the two separate <code>l</code> spikes in "hello".</figcaption></figure>
+</section>
+
+<!-- ============================ CONNECT ============================ -->
+<section id="connect">
+  <h2><span class="num">05</span>Putting It All Together</h2>
+  <p class="lead">How the models you built slot into the production system.</p>
+  <div class="flow">
+    <div class="node accent"><b>WS audio</b><small>20–30ms chunks</small></div><div class="arrow">→</div>
+    <div class="node"><b>Log-mel</b><small>shared front-end</small></div><div class="arrow">→</div>
+    <div class="node"><b>VAD gate</b><small>+ hysteresis → speech segments only</small></div><div class="arrow">→</div>
+    <div class="node warn"><b>ASR (CTC)</b><small>batched on GPU</small></div><div class="arrow">→</div>
+    <div class="node accent"><b>Partial text</b><small>streamed back over WS</small></div>
+  </div>
+  <div class="grid three">
+    <div class="card"><b>Latency lever</b><br><small>VAD look-ahead &amp; ASR batch-wait both trade latency for quality/throughput.</small></div>
+    <div class="card"><b>Cost lever</b><br><small>VAD gating + dynamic batching cut GPU spend dramatically.</small></div>
+    <div class="card"><b>Stability lever</b><br><small>Bounded queues + load-shedding keep the box alive under spikes.</small></div>
+  </div>
+  <div class="callout">For true low-latency streaming ASR (instead of full-utterance CTC), the production
+     architecture of choice is the <b>RNN-Transducer (RNN-T)</b> — it emits text as audio arrives. That's
+     the natural next model to build, and it ties directly back to this system-design problem.</div>
+</section>
+
+<!-- ============================ RESOURCES ============================ -->
+<section id="resources">
+  <h2><span class="num">06</span>Study Guide — go deep</h2>
+  <p class="lead">Curated, high-signal resources. <span class="badge b-book">book/text</span>
+     <span class="badge b-paper">paper</span> <span class="badge b-video">video</span>
+     <span class="badge b-course">course</span> · <span class="star">★</span> = start here.</p>
+
+  <div class="grid two">
+    <div class="res-group card res">
+      <h3>🎧 Audio DSP &amp; Features</h3>
+      <ul class="clean">
+        <li><a href="https://www.youtube.com/playlist?list=PL-wATfeyAMNqIee7cH3q1bh4QJFAaeNv0">Valerio Velardo — Audio Signal Processing for ML</a> <span class="badge b-video">video</span> <span class="star">★</span><small>The best practical series on waveforms, FFT, mel spectrograms, MFCC.</small></li>
+        <li><a href="https://www.youtube.com/watch?v=spUNpyF58BY">3Blue1Brown — But what is the Fourier Transform?</a> <span class="badge b-video">video</span><small>Visual intuition for the transform at the heart of spectrograms.</small></li>
+        <li><a href="https://www.dspguide.com/">The Scientist &amp; Engineer's Guide to DSP</a> <span class="badge b-book">book</span><small>Free, classic, gentle DSP reference (Steven Smith).</small></li>
+        <li><a href="https://librosa.org/doc/latest/index.html">librosa documentation</a> <span class="badge b-book">text</span><small>Reference implementations of every feature we hand-built.</small></li>
+      </ul>
+    </div>
+
+    <div class="res-group card res">
+      <h3>🔊 Voice Activity Detection</h3>
+      <ul class="clean">
+        <li><a href="https://github.com/snakers4/silero-vad">Silero VAD (GitHub)</a> <span class="badge b-book">text</span> <span class="star">★</span><small>The modern production VAD — read the README &amp; usage; great baseline to compare against.</small></li>
+        <li><a href="https://github.com/wiseman/py-webrtcvad">WebRTC VAD (py-webrtcvad)</a> <span class="badge b-book">text</span><small>The classical DSP approach (no ML) — understand the energy/GMM baseline.</small></li>
+        <li><a href="https://arxiv.org/abs/2104.04045">MarbleNet (NVIDIA) paper</a> <span class="badge b-paper">paper</span><small>A compact 1-D conv VAD — close cousin of what you built.</small></li>
+      </ul>
+    </div>
+
+    <div class="res-group card res">
+      <h3>🧠 ASR &amp; CTC (core)</h3>
+      <ul class="clean">
+        <li><a href="https://distill.pub/2017/ctc/">Awni Hannun — Sequence Modeling with CTC (Distill)</a> <span class="badge b-paper">paper</span> <span class="star">★</span><small>THE canonical CTC explainer. Read this in full.</small></li>
+        <li><a href="https://www.cs.toronto.edu/~graves/icml_2006.pdf">Graves et al. 2006 — Connectionist Temporal Classification</a> <span class="badge b-paper">paper</span><small>The original CTC paper.</small></li>
+        <li><a href="https://huggingface.co/learn/audio-course">Hugging Face Audio Course</a> <span class="badge b-course">course</span> <span class="star">★</span><small>Free, modern, hands-on: features, CTC, Whisper, fine-tuning.</small></li>
+        <li><a href="https://web.stanford.edu/~jurafsky/slp3/">Jurafsky &amp; Martin — Speech &amp; Language Processing (3rd ed, free)</a> <span class="badge b-book">book</span> <span class="star">★</span><small>Ch. on ASR, feature extraction, language models. The standard text.</small></li>
+        <li><a href="https://web.stanford.edu/class/cs224s/">Stanford CS224S — Spoken Language Processing</a> <span class="badge b-course">course</span><small>Full university course; slides &amp; syllabus public.</small></li>
+      </ul>
+    </div>
+
+    <div class="res-group card res">
+      <h3>📈 Beyond CTC (architectures)</h3>
+      <ul class="clean">
+        <li><a href="https://arxiv.org/abs/1512.02595">Deep Speech 2</a> <span class="badge b-paper">paper</span><small>Conv + RNN + CTC at scale — basically the model you built, industrialized.</small></li>
+        <li><a href="https://arxiv.org/abs/1211.3711">Graves — Sequence Transduction (RNN-T)</a> <span class="badge b-paper">paper</span> <span class="star">★</span><small>The streaming ASR model. Your low-latency next step.</small></li>
+        <li><a href="https://arxiv.org/abs/1508.01211">Listen, Attend and Spell</a> <span class="badge b-paper">paper</span><small>The attention/encoder-decoder approach to ASR.</small></li>
+        <li><a href="https://arxiv.org/abs/2005.08100">Conformer</a> <span class="badge b-paper">paper</span><small>Conv-augmented Transformer — the modern ASR encoder.</small></li>
+        <li><a href="https://arxiv.org/abs/2212.04356">Whisper (Radford et al.)</a> <span class="badge b-paper">paper</span><small>Large-scale weakly-supervised encoder-decoder ASR.</small></li>
+        <li><a href="https://arxiv.org/abs/2006.11477">wav2vec 2.0</a> <span class="badge b-paper">paper</span><small>Self-supervised speech representation learning.</small></li>
+      </ul>
+    </div>
+
+    <div class="res-group card res">
+      <h3>🤖 Deep Learning foundations</h3>
+      <ul class="clean">
+        <li><a href="https://www.youtube.com/playlist?list=PLAqhIrjkxbuWI23v9cThsA9GvCAUhRvKZ">Andrej Karpathy — Neural Networks: Zero to Hero</a> <span class="badge b-video">video</span> <span class="star">★</span><small>Build backprop, RNNs, and a Transformer from scratch. Unbeatable.</small></li>
+        <li><a href="https://d2l.ai/">Dive into Deep Learning (d2l.ai)</a> <span class="badge b-book">book</span><small>Free interactive text: RNN/LSTM/GRU, attention, Transformers, with code.</small></li>
+        <li><a href="https://jalammar.github.io/illustrated-transformer/">The Illustrated Transformer</a> <span class="badge b-paper">text</span><small>The clearest visual intro to attention.</small></li>
+        <li><a href="https://www.youtube.com/@statquest">StatQuest</a> <span class="badge b-video">video</span><small>Gentle intuition for ML fundamentals, RNNs/LSTMs.</small></li>
+      </ul>
+    </div>
+
+    <div class="res-group card res">
+      <h3>⚙️ Systems: async, queues, backpressure</h3>
+      <ul class="clean">
+        <li><a href="https://dataintensive.net/">Designing Data-Intensive Applications (Kleppmann)</a> <span class="badge b-book">book</span> <span class="star">★</span><small>The bible for queues, streaming, backpressure, reliability.</small></li>
+        <li><a href="https://docs.python.org/3/library/asyncio.html">Python asyncio docs</a> <span class="badge b-book">text</span><small>Event loop, coroutines, queues — why blocking calls are fatal.</small></li>
+        <li><a href="https://fastapi.tiangolo.com/advanced/websockets/">FastAPI WebSockets</a> <span class="badge b-book">text</span><small>The gateway framework; WS handling patterns.</small></li>
+        <li><a href="https://redis.io/docs/latest/develop/data-types/streams/">Redis Streams</a> <span class="badge b-book">text</span><small>Consumer groups, queue depth, the decoupling layer.</small></li>
+        <li><a href="https://docs.ray.io/en/latest/serve/index.html">Ray Serve</a> <span class="badge b-book">text</span><small>Python-native distributed serving + dynamic batching.</small></li>
+        <li><a href="https://github.com/triton-inference-server/server">NVIDIA Triton Inference Server</a> <span class="badge b-book">text</span><small>Production dynamic batching / model serving on GPU.</small></li>
+      </ul>
+    </div>
+
+    <div class="res-group card res">
+      <h3>🛠️ Toolkits to read &amp; learn from</h3>
+      <ul class="clean">
+        <li><a href="https://github.com/NVIDIA/NeMo">NVIDIA NeMo</a> <span class="badge b-book">code</span><small>Production ASR/TTS recipes (CTC, RNN-T, Conformer).</small></li>
+        <li><a href="https://github.com/espnet/espnet">ESPnet</a> <span class="badge b-book">code</span><small>End-to-end speech research toolkit.</small></li>
+        <li><a href="https://github.com/speechbrain/speechbrain">SpeechBrain</a> <span class="badge b-book">code</span><small>Readable PyTorch recipes — great for learning.</small></li>
+        <li><a href="https://github.com/k2-fsa/icefall">k2 / icefall</a> <span class="badge b-book">code</span><small>Modern FST-based ASR (next-gen Kaldi).</small></li>
+      </ul>
+    </div>
+
+    <div class="res-group card res">
+      <h3>🗺️ Suggested order</h3>
+      <ul class="clean">
+        <li><b>1.</b> Velardo audio series + 3B1B Fourier → understand features.</li>
+        <li><b>2.</b> Karpathy Zero-to-Hero → RNNs &amp; Transformers from scratch.</li>
+        <li><b>3.</b> Distill CTC + Jurafsky ASR chapters → the core theory.</li>
+        <li><b>4.</b> HF Audio Course → modern hands-on, Whisper.</li>
+        <li><b>5.</b> RNN-T &amp; Conformer papers → streaming + SOTA.</li>
+        <li><b>6.</b> Kleppmann DDIA → the production system side.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  Built alongside your from-scratch VAD + ASR project · open the <code>scripts/</code> in order,
+  and re-open this page anytime as your map.
+</footer>
+
+</body>
+</html>

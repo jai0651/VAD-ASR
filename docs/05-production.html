@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>5 · Production Inference — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>Production <span>Inference</span></h1>
+  <p>What separates "my model works" from "my service works": loading, latency,
+     concurrency, observability, scale — grounded in what this repo implements
+     and honest about what it skips.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← hub</a> · <a href="04-tts.html">tts</a></div>
+
+<h2><span class="num">5.1</span>The mental shift</h2>
+<p>Research asks "is the output good?". Serving asks five different questions:
+<strong>how fast (p95, not average) · how many at once · what breaks and who notices ·
+how much per request · how do I change it safely</strong>. Every section below is one of
+these questions applied to speech.</p>
+
+<h2><span class="num">5.2</span>Model lifecycle</h2>
+<ul>
+<li><strong>Load once, share, never per-request</strong> — weights are immutable so they're
+safe to share across sessions; loading is seconds and hundreds of MB. In
+<code>server/app.py</code> this is the FastAPI lifespan hook. The rule's other half:
+per-session <em>state</em> (VAD RNN state, endpointer, conversation) is never shared.</li>
+<li><strong>Readiness ≠ liveness</strong> — <code>/healthz</code> returns 503 until models
+are loaded, so a load balancer doesn't route to a replica still downloading weights. In
+Kubernetes terms: that's the readiness probe; liveness would be "the process responds at all".</li>
+<li><strong>Weights are artifacts, not code</strong> — checkpoints download at first run to
+a cache (<code>models/</code>), pinned by name/version. Production adds checksums and a
+model registry; the shape is the same.</li>
+</ul>
+
+<h2><span class="num">5.3</span>Latency engineering</h2>
+<ul>
+<li><strong>Measure percentiles per stage.</strong> <code>/metrics</code> reports p50/p95
+for asr_ms, tts_sentence_ms, and turnaround_ms. Never averages: latency is long-tailed and
+the tail is what users feel. The stage decomposition is what makes tuning possible —
+you can't fix "it feels slow"; you can fix "tts first-chunk p95 is 1.4 s".</li>
+<li><strong>RTF (real-time factor)</strong> = processing time ÷ audio duration, the speech
+world's throughput unit. RTF 0.08 (our whisper measurement) means 1 CPU core transcribes
+~12 concurrent real-time streams, ignoring overheads. Capacity planning starts here.</li>
+<li><strong>Pipeline, don't accelerate.</strong> The cheapest big win in this repo wasn't a
+faster model — it was sentence-streaming TTS (time-to-first-audio ≈ sentence 1 instead of
+the whole reply) and continuing to run VAD during ASR/TTS. Overlap hides latency for free.</li>
+<li><strong>Quantization</strong>: whisper here runs int8 — 4× smaller, ~2-4× faster on CPU,
+negligible WER change. The same knob exists for every engine (ONNX quantization for
+Silero/Kokoro). Rule of thumb: int8 weight-only is nearly free; going lower needs evals.</li>
+</ul>
+
+<h2><span class="num">5.4</span>Concurrency architecture</h2>
+<div class="diagram">
+ asyncio event loop  ─ owns: sockets, VAD (&lt;1 ms), state machine   <span class="a">never blocks</span>
+       │ asyncio.to_thread
+ worker threads      ─ own: ASR + TTS (blocking, CPU-heavy)
+       │ (in bigger deployments this seam becomes a network hop)
+ GPU worker pool     ─ dynamic batching, e.g. Triton / Ray Serve / vLLM-style
+</div>
+<p>Three levels of the same idea — keep the I/O plane responsive, put compute elsewhere:</p>
+<ol>
+<li><strong>This repo</strong>: threads. Fine for a handful of sessions per process;
+PyTorch/CTranslate2 release the GIL inside kernels so threads genuinely parallelize.</li>
+<li><strong>One box, many sessions</strong>: a bounded worker pool + queue. Bounded matters:
+under overload you want queuing (graceful latency degradation) not thrashing.</li>
+<li><strong>Fleet</strong>: models move behind RPC. The pipeline server becomes a
+lightweight session host; ASR/TTS become stateless services with <strong>dynamic
+batching</strong> — the server collects requests for a few ms and runs them as one batch,
+because GPUs are throughput machines: batch 8 costs barely more than batch 1. This is
+Triton's / vLLM's whole reason to exist, and why commercial STT APIs are priced per-minute
+so cheaply.</li>
+</ol>
+<div class="callout">
+  <span class="label">Why our engine interfaces survive all three levels</span>
+  <code>transcribe(audio) → Transcript</code> doesn't say whether the work happens in a
+  thread, another process, or another datacenter. That seam — cut here for testing — is
+  exactly where the network goes later. Design interfaces for level 3 even when shipping
+  level 1.
+</div>
+
+<h2><span class="num">5.5</span>Failure behavior</h2>
+<ul>
+<li><strong>A failed turn must not kill the session</strong> — the orchestrator catches
+per-turn exceptions, emits an <code>error</code> event, returns to LISTENING. The user
+hears "nothing happened", retries, and the metrics counter increments.</li>
+<li><strong>Cancellation is a feature</strong> (barge-in), so all turn work lives in one
+cancellable task — cleanup is structural, not ad hoc.</li>
+<li><strong>Bound everything</strong>: max utterance length (30 s), min utterance (250 ms),
+bounded metric windows. Unbounded buffers are how "it ran fine for a week" becomes an OOM
+page at 3 a.m.</li>
+<li><strong>Backpressure (not implemented here)</strong>: if a client streams faster than
+real-time or workers saturate, production servers shed load explicitly (reject new sessions
+at a queue-depth threshold) rather than letting latency creep for everyone.</li>
+</ul>
+
+<h2><span class="num">5.6</span>Observability beyond latency</h2>
+<div class="tablewrap"><table>
+<tr><th>Signal</th><th>What it catches</th></tr>
+<tr><td>turnaround p95 (ours)</td><td>the product experience, end to end</td></tr>
+<tr><td>barge-in rate (ours)</td><td>agents that ramble get interrupted more — a UX metric disguised as a counter</td></tr>
+<tr><td>utterances discarded (ours)</td><td>VAD too twitchy / thresholds wrong for this mic population</td></tr>
+<tr><td>empty-transcript rate</td><td>endpointer shipping noise, or ASR failing on an accent/noise slice</td></tr>
+<tr><td>ASR confidence / logprob drift</td><td>input distribution shifted (new codec, new device, new market) — the production echo of our zeros-vs-noise bug</td></tr>
+<tr><td>per-stage error counters</td><td>which dependency is burning</td></tr>
+</table></div>
+<p>Production wraps these in Prometheus + traces (one trace per turn, spans per stage —
+our event log is morally a trace) and dashboards per release. The structure is already
+what <code>/metrics</code> returns; only the plumbing gets bigger.</p>
+
+<h2><span class="num">5.7</span>Telephony notes (the other half of the real world)</h2>
+<p>Voice agents deployed to phone lines meet a harsher world than a browser mic:</p>
+<ul>
+<li><strong>8 kHz, G.711 μ-law</strong> — half our bandwidth, a compressive 8-bit codec.
+Models trained on 16 kHz clean audio degrade badly; production either uses
+telephony-trained models or accepts the hit. (This is why ASR vendors advertise
+"phone_call" models separately.)</li>
+<li><strong>Media streams arrive as RTP or vendor WebSocket streams</strong> (e.g.
+Twilio/Plivo media streams look remarkably like our protocol: base64 PCM frames + JSON
+control messages — the architecture you just built maps 1:1).</li>
+<li><strong>No browser AEC</strong> — echo cancellation, comfort noise, DTMF detection, and
+jitter buffers become your problem.</li>
+<li><strong>Endpointing expectations differ</strong> — callers tolerate ~200 ms less silence
+than app users; IVR-replacement agents tune <code>end_silence_ms</code> per prompt type.</li>
+</ul>
+
+<h2><span class="num">5.8</span>Honest list: what this repo simplifies</h2>
+<ul>
+<li>No auth/TLS/rate limiting on the WebSocket; no reconnection or session resumption.</li>
+<li>Raw PCM instead of Opus/μ-law; localhost-scale bandwidth assumptions.</li>
+<li>Fixed-timeout endpointing (no semantic turn detection); browser-provided AEC only.</li>
+<li>Utterance-based ASR (no streaming partials); echo responder instead of an LLM
+(the seam is <code>Responder</code> — one method to swap in a streaming LLM).</li>
+<li>Single process, thread-level concurrency; no autoscaling, batching service, or model
+registry.</li>
+</ul>
+<p>Each is an extension, not a rewrite: the state machine, the engine seams, and the
+metrics decomposition are the parts that survive contact with production — and they're
+the parts this repo builds fully.</p>
+
+</main>
+<footer class="nav">
+  <a href="04-tts.html">← TTS</a>
+  <a href="06-decisions.html">Next: Decision log →</a>
+</footer>
+</body>
+</html>

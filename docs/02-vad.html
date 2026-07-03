@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>2 · VAD Deep Dive — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>VAD <span>Deep Dive</span></h1>
+  <p>Voice Activity Detection: the smallest model in the stack and the one that runs
+     the most. Code: <code>src/vad/</code>, <code>src/pipeline/vad.py</code>,
+     <code>src/pipeline/endpointing.py</code>.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← hub</a> · <a href="01-pipeline.html">pipeline</a></div>
+
+<h2><span class="num">2.1</span>The problem, precisely</h2>
+<p>Input: a stream of short audio windows (10–32 ms). Output per window: <strong>P(speech)</strong>.
+It looks like trivial binary classification. What makes it a real problem is the negative
+class: silence is easy, but the world is full of <em>speech-shaped non-speech</em> —
+music, TV in the background, keyboard clatter, babble from the next desk, your own agent's
+voice. VAD quality is almost entirely about how hard your negatives were at training time.</p>
+
+<h3>Why not just an energy threshold?</h3>
+<p>Energy ("is it loud?") fails both directions: quiet speech (whisper, far mic) is speech,
+and a slammed door is not. Speech has <em>structure</em> that loudness doesn't capture:</p>
+<ul>
+  <li><strong>Harmonics</strong> — voiced sounds are a fundamental (~80–250 Hz) plus stacked
+  overtones, shaped by vocal-tract resonances (formants).</li>
+  <li><strong>Modulation rhythm</strong> — energy pulses at the ~4–7 Hz syllable rate;
+  steady noise doesn't.</li>
+</ul>
+<p>Your synthetic generator (<code>src/vad/data.py</code>) manufactures exactly these two
+cues — which is why a tiny model can learn them, and (see 2.5) why it breaks on inputs
+that violate its synthetic world.</p>
+
+<h2><span class="num">2.2</span>Your VADNet: what its parts are for</h2>
+<div class="diagram">
+ log-mel (T, 80)
+   │  treat 80 mel bins as <span class="a">channels</span>, time as the conv axis
+   ▼
+ Conv1d(80→64, k=5) + BN + ReLU   ×3     <span class="m">receptive field: 13 frames ≈ 130 ms</span>
+   ▼
+ Conv1d(64→1, k=1)                        <span class="m">per-frame logit</span>
+   ▼
+ sigmoid → P(speech) per 10 ms frame      <span class="m">~55k params</span>
+</div>
+<p>The conv-over-time is the load-bearing idea: a frame is far more likely to be speech if
+its neighbours are. Giving each output a 130 ms window bakes the temporal-continuity prior
+into the architecture instead of bolting it on afterwards. Everything else (BN, ReLU) is
+plumbing.</p>
+
+<h3>Streaming it (<code>src/pipeline/scratch_engines.py</code>)</h3>
+<p>Training saw whole utterances; live audio arrives in chunks. Two edge problems and their
+fixes: (1) a chunk's first frames would lose their left-context → keep a rolling buffer of
+the last 12 mel frames and prepend it; (2) analysis frames are 400 samples but hop is 160 →
+keep the 240-sample overlap tail between pushes. No look-ahead is used: future context would
+sharpen boundaries but every frame of look-ahead is a frame of added latency — the eternal
+streaming trade-off.</p>
+
+<h2><span class="num">2.3</span>Silero VAD: what a production VAD does differently</h2>
+<div class="tablewrap"><table>
+<tr><th></th><th>Your VADNet</th><th>Silero VAD v5</th></tr>
+<tr><td>Params / size</td><td>~55k / 220 kB</td><td>~1.8 MB ONNX</td></tr>
+<tr><td>Architecture</td><td>1-D conv stack (feed-forward)</td><td>learned filterbank encoder + <strong>recurrent state</strong> carried across windows</td></tr>
+<tr><td>Training data</td><td>synthetic tones + noise (yours, minutes)</td><td>~100+ languages, thousands of hours, curated hard negatives (music, babble, clicks)</td></tr>
+<tr><td>Interface</td><td>any chunking (we frame internally)</td><td>exactly 512-sample windows @16 kHz; <code>reset_states()</code> between streams</td></tr>
+<tr><td>Cost</td><td>&lt;1 ms/win CPU</td><td>&lt;1 ms/win CPU</td></tr>
+</table></div>
+<p>Read that table bottom-up: the <em>run cost is identical</em> and the architecture is
+only mildly fancier. The entire quality difference is <strong>data</strong>. That's the
+recurring theme of this repo: for small speech models, architecture is rarely the moat;
+training distribution is. The RNN state also explains a subtlety: Silero accumulates
+evidence <em>across</em> windows, so each concurrent stream needs its own model instance —
+which is why the factory builds VADs per session.</p>
+
+<div class="callout prod">
+  <span class="label">Also seen in the wild</span>
+  <strong>WebRTC VAD</strong> — a 1990s-style GMM on spectral features; ultra-cheap, very
+  trigger-happy on noise; fine as a first gate. <strong>Energy gates in telephony</strong> —
+  still used as pre-filters. The modern default for self-hosted stacks is Silero;
+  cloud ASR APIs embed their own VAD server-side.
+</div>
+
+<h2><span class="num">2.4</span>Endpointing: the layer beginners miss</h2>
+<p>VAD answers a 32 ms question. The orchestrator needs a <em>turn-level</em> answer:
+"the user has finished talking — ship the utterance to ASR." That's a policy state machine
+(<code>src/pipeline/endpointing.py</code>), and each knob exists because of a specific
+failure you'd otherwise ship:</p>
+
+<div class="tablewrap"><table>
+<tr><th>Knob (default)</th><th>Failure it prevents</th></tr>
+<tr><td><code>start_trigger_ms</code> (96)</td><td>a cough or click opening a turn (debounce)</td></tr>
+<tr><td><code>pre_roll_ms</code> (320)</td><td><strong>clipped first words</strong>: VAD confirmation is late by construction, so keep a ring buffer of audio from <em>before</em> the trigger — otherwise "seventy" arrives at ASR as "eventy"</td></tr>
+<tr><td><code>end_silence_ms</code> (700)</td><td>too short → cuts users off mid-thought at every pause; too long → the agent feels laggy. THE latency/accuracy dial (see pipeline page)</td></tr>
+<tr><td>hysteresis: <code>end_threshold</code> (0.35) &lt; <code>start_threshold</code> (0.5)</td><td>mid-word probability dips ending the turn — same two-threshold trick as your Module 1 gate, one level up</td></tr>
+<tr><td><code>min_utterance_ms</code> (250)</td><td>shipping a 100 ms blip to ASR (Whisper will happily hallucinate a sentence from it)</td></tr>
+<tr><td><code>max_utterance_s</code> (30)</td><td>unbounded buffering when something (a fan, self-echo) pins VAD high</td></tr>
+</table></div>
+
+<p>Because it's pure logic over (window, probability) pairs, it's exhaustively unit-tested
+(<code>tests/test_endpointing.py</code>) — no models, no audio files, milliseconds. Keeping
+policy separate from models is what makes that possible.</p>
+
+<h2><span class="num">2.5</span>A real bug: the domain-mismatch lesson</h2>
+<p>While wiring the e2e test we padded the utterance with <strong>digital zeros</strong> to
+simulate the user going quiet. Measured behaviour of your VAD on the padding:</p>
+
+<div class="kpi">
+  <div class="box"><div class="v">0.335</div><div class="k">mean P(speech) on exact zeros — flickers at the threshold</div></div>
+  <div class="box"><div class="v">0.004</div><div class="k">mean P(speech) on mic-like noise (σ=0.005)</div></div>
+</div>
+
+<p>The endpointer never closed the turn. Why: the training generator <em>always</em> added
+a faint background noise floor, so "perfect digital silence" (log-mel = a uniform −23 wall)
+is out-of-distribution — the model had literally never seen it. Real microphones always
+have a noise floor, so the fix was to make the test realistic (pad with quiet noise),
+not to retrain.</p>
+<div class="callout warn">
+  <span class="label">The general lesson (train/serve skew)</span>
+  Models don't fail loudly on out-of-distribution input — they return confident-looking
+  garbage. The inputs your serving path can produce (digital silence, clipped int16,
+  resampler artifacts, wrong gain) must exist in training, or be normalized away before
+  the model. Production speech teams keep "input hygiene" test suites for exactly this.
+</div>
+
+<h3>...and the same bug, live, in the other direction</h3>
+<p>First real-microphone session with the scratch VAD: <strong>P(speech) pinned high on
+room ambience</strong> — a real browser mic (with its noise-suppression processing, room
+tone, and gain) is as out-of-distribution for the synthetic-data model as digital zeros
+were, just in the opposite direction. The failure cascaded beautifully: turns never ended
+(both closed at the 30 s hard cap — visible in <code>/metrics</code> as
+<code>utterance_ms p50 = 30000</code>), and the moment the agent started answering, the
+pinned VAD triggered a phantom <em>barge-in</em> that flushed the reply — "it's not
+responding" was actually "it responded and immediately interrupted itself".</p>
+<p>Two fixes came out of it: the client now shows a <strong>live P(speech) readout</strong>
+(the single most useful debug signal in the pipeline — near 0 in silence and near 1 while
+you talk means healthy), and the practical remedy is <code>VOICE_VAD_ENGINE=silero</code>,
+whose thousands of hours of real-mic training data are precisely the moat described in
+2.3. Making the scratch VAD mic-robust would mean training on real speech + real noise
+(LibriSpeech + MUSAN) instead of synthesis — a great exercise.</p>
+
+<h2><span class="num">2.6</span>Evaluation: how VAD quality is actually measured</h2>
+<ul>
+  <li><strong>Frame level</strong>: precision/recall per frame (your Module 1 accuracy is the
+  toy version). Almost never what users feel.</li>
+  <li><strong>Boundary level</strong>: how late is speech onset detected (clipping risk), how
+  late is the endpoint (latency)? Reported as onset/offset latency distributions.</li>
+  <li><strong>System level</strong>: did ASR WER change? did turnaround p95 change? A VAD is
+  only ever as good as the pipeline it gates — the reason we expose <code>/metrics</code>
+  rather than a standalone VAD score.</li>
+</ul>
+
+</main>
+<footer class="nav">
+  <a href="01-pipeline.html">← Pipeline</a>
+  <a href="03-asr.html">Next: ASR deep dive →</a>
+</footer>
+</body>
+</html>
