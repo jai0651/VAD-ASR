@@ -41,7 +41,9 @@ class PipelineConfig(BaseSettings):
     openai_api_key: str = Field("", validation_alias="OPENAI_API_KEY")
 
     # ---- from-scratch model checkpoints (produced by the training scripts) ----
-    scratch_vad_ckpt: str = "outputs/vad.pt"
+    # "auto" = prefer the real-audio VAD (outputs/vad_real.pt, scripts/09) and
+    # fall back to the synthetic one (outputs/vad.pt, scripts/01).
+    scratch_vad_ckpt: str = "auto"
     scratch_asr_ckpt: str = "outputs/asr_libri.pt"
     scratch_tts_ckpt: str = "outputs/tts.pt"
 

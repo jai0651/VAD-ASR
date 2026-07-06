@@ -142,7 +142,44 @@ whose thousands of hours of real-mic training data are precisely the moat descri
 2.3. Making the scratch VAD mic-robust would mean training on real speech + real noise
 (LibriSpeech + MUSAN) instead of synthesis — a great exercise.</p>
 
-<h2><span class="num">2.6</span>Evaluation: how VAD quality is actually measured</h2>
+<h2><span class="num">2.6</span>Module 1b: the real-audio retrain (the fix, from scratch)</h2>
+<p>The repair for 2.5 keeps the 55k-param architecture <em>byte-identical</em> and replaces
+only the training data (<code>src/vad/data_real.py</code>, trained by
+<code>scripts/09_train_vad_real.py</code>) — deliberately proving that for small speech
+models, <strong>the data is the model</strong>. The recipe is a miniature of how real VAD
+training sets (MUSAN-style) are built:</p>
+<ul>
+<li><strong>Real speech, free labels.</strong> Speech clips come from LibriSpeech (real
+voices, all ~2,700 dev-clean utterances). Utterances contain pauses, so labeling every
+frame "speech" would re-teach the 2.5 bug — instead, per-frame energy is gated on the
+<em>clean</em> clip (within 30 dB of its peak = speech), and only then is noise mixed on
+top. The labels stay ground-truth because they were made before the corruption.</li>
+<li><strong>Hard negatives = what a mic actually sends.</strong> Colored noise from faint
+to loud (room tone), <em>babble</em> built by summing 6 real overlapping speakers (MUSAN's
+own trick — the hardest negative, speech-band energy without single-voice structure),
+mains hum, near-silence, and pure digital zeros — the 2.5 out-of-distribution input, now
+in-domain by construction.</li>
+<li><strong>Augmentation = the serving path's dirt.</strong> Random SNR (0–25 dB), random
+gain (−20–0 dB), occasional clipping; half the examples contain no speech at all, because
+a VAD must be confident about pure background, not merely prefer speech.</li>
+</ul>
+<p>The training script ends with the eval that matters: mean P(speech) on exactly the
+scenarios that failed live. Checkpoints are <strong>selected on that score</strong>, not
+taken from the last step — measured trajectory 0.67 → 0.81 with repeated regressions
+(the final step scored 0.70, and one intermediate run pinned digital zeros at 0.91!);
+same oscillation lesson as the TTS module. The shipped checkpoint:</p>
+<div class="kpi">
+  <div class="box"><div class="v">0.009</div><div class="k">digital zeros (was the OOD bug)</div></div>
+  <div class="box"><div class="v">0.01–0.04</div><div class="k">room noise / hum (was ≈1 live)</div></div>
+  <div class="box"><div class="v">0.78</div><div class="k">speech, clean or over noise</div></div>
+  <div class="box"><div class="v">0.87</div><div class="k">held-out frame accuracy</div></div>
+</div>
+<p>Honest soft spots: 6-speaker babble sits at ≈0.50 (right at the threshold — genuinely
+the hardest negative) and very quiet speech (−26 dB) at ≈0.47 may fail to trigger. The
+pipeline picks the new checkpoint up automatically (<code>scratch_vad_ckpt="auto"</code>
+prefers <code>vad_real.pt</code>).</p>
+
+<h2><span class="num">2.7</span>Evaluation: how VAD quality is actually measured</h2>
 <ul>
   <li><strong>Frame level</strong>: precision/recall per frame (your Module 1 accuracy is the
   toy version). Almost never what users feel.</li>

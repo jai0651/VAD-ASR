@@ -51,6 +51,7 @@ uv run python scripts/02_vad_stream.py    # run VAD in streaming mode + smoothin
 uv run python scripts/03_ctc_intuition.py # the CTC collapse rule + a tiny CTC fit
 uv run python scripts/04_train_asr.py     # train the CTC ASR (-> outputs/asr.pt)
 uv run python scripts/05_train_asr_libri.py # same ASR on real speech (-> asr_libri.pt)
+uv run python scripts/09_train_vad_real.py  # VAD retrained on REAL audio (-> vad_real.pt)
 uv run python scripts/07_vocoder_roundtrip.py # hear Griffin-Lim invert your mels
 uv run python scripts/08_train_tts.py     # train the TTS (-> outputs/tts.pt)
 uv run python scripts/06_pipeline_e2e.py  # full VAD->ASR->TTS pipeline, no mic

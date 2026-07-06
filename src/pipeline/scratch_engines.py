@@ -57,7 +57,16 @@ class ScratchVAD:
     window = 160  # 10 ms hop = samples "consumed" per decision
 
     def __init__(self, cfg: PipelineConfig, context_frames: int = 12):
-        ckpt = _require(cfg.scratch_vad_ckpt, "uv run python scripts/01_train_vad.py")
+        if cfg.scratch_vad_ckpt == "auto":
+            # Prefer the real-audio model (Module 1b) — the synthetic one is
+            # known to pin high on live microphones (docs/02-vad.html §2.5).
+            path = "outputs/vad_real.pt"
+            if not Path(path).exists():
+                path = "outputs/vad.pt"
+        else:
+            path = cfg.scratch_vad_ckpt
+        ckpt = _require(path, "uv run python scripts/09_train_vad_real.py")
+        print(f"[vad] scratch checkpoint: {ckpt}")
         self.model = VADNet(n_mels=80)
         self.model.load_state_dict(torch.load(ckpt, map_location="cpu"))
         self.model.eval()

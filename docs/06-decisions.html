@@ -208,6 +208,26 @@ rather than retraining the model for an input real serving never produces.</p>
 tests (docs 2.5).</p>
 </div>
 
+<h2><span class="num">D13b</span>VAD live-mic failure fixed by retraining on real audio — architecture untouched</h2>
+<div class="card">
+<p><strong>Evidence (live incident):</strong> first real-mic session, synthetic-data VAD:
+P(speech) pinned high on room ambience → both turns force-closed at the 30 s cap
+(<code>utterance_ms p50 = 30000</code> in /metrics) → phantom barge-in flushed the reply
+the instant the agent spoke. "Not responding" was actually "responding and interrupting
+itself".</p>
+<p><strong>Decision:</strong> Module 1b — keep VADNet byte-identical, replace only the
+data: real LibriSpeech speech with energy-gated frame labels (labeled clean, then
+corrupted), MUSAN-style hard negatives (colored room noise, 6-speaker babble from real
+voices, mains hum, digital zeros), SNR/gain/clipping augmentation. Checkpoint resolution
+is "auto": the pipeline prefers <code>vad_real.pt</code> when present.</p>
+<p><strong>Alternatives:</strong> just default to Silero (hides the lesson; the repo's
+point is from-scratch models that actually work); download MUSAN (~11 GB for a learning
+repo when babble can be built from LibriSpeech itself).</p>
+<p><strong>Also shipped from the incident:</strong> live P(speech) telemetry to the client
+(~2/s) and honest engine names in the UI (the header used to hardcode
+"Whisper → Kokoro" regardless of config).</p>
+</div>
+
 <h2><span class="num">D14</span>Whisper's own VAD filter and text-conditioning are OFF</h2>
 <div class="card">
 <p><strong>Why:</strong> our endpointer already trims silence — a second VAD adds latency
