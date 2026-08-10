@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>11 · The Neural Vocoder — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>The Neural <span>Vocoder</span></h1>
+  <p>Module 7: removing the one ceiling in this repo that no amount of training
+     data can lift — Griffin-Lim's guessed phase — by predicting phase instead
+     of iterating toward it.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← hub</a> · <a href="04-tts.html">module 4 tts</a> · <a href="08-sota.html">state of the art</a></div>
+
+<h2><span class="num">11.1</span>The ceiling</h2>
+<p>Module 0 computed <code>|X|²</code> and threw the phase away. Module 4's
+Griffin-Lim gets it back by exploiting frame overlap: guess a phase, inverse
+transform, re-measure the phase, keep our magnitude, repeat. After 60 rounds the
+(magnitude, phase) pair is <em>self-consistent</em>.</p>
+<p>Self-consistent is not correct. There are many phase fields consistent with a
+given magnitude spectrogram, and the one Griffin-Lim converges to is generally
+not the one the speaker produced. That mismatch is audible as the phasey,
+metallic, slightly-underwater quality of every Griffin-Lim sample in
+<code>outputs/</code>.</p>
+
+<div class="callout warn">
+<span class="label">Why this is different from every other gap in the repo</span>
+<a href="08-sota.html">§8</a> separated five kinds of gap — data, scale,
+architecture, recipe, inference. Almost everywhere, more data helps. Here it
+<strong>cannot</strong>, at any quantity, because the limitation is not in a
+learned component at all. Griffin-Lim has zero parameters. You could train the
+Tacotron on ten thousand hours and the output would still sound phasey. That is
+what makes this the highest-value single change available to Module 4 — and why
+it is worth doing before any more TTS data work.
+</div>
+
+<h2><span class="num">11.2</span>Two families, and why we pick the cheap one</h2>
+<div class="tablewrap">
+<table>
+<tr><th></th><th>time-domain (HiFi-GAN, 2020)</th><th>spectral-domain (Vocos / iSTFTNet, 2023) ← ours</th></tr>
+<tr><td>what it predicts</td><td>every output sample</td><td>magnitude + phase per STFT frame</td></tr>
+<tr><td>how it upsamples</td><td>transposed convs, ×160 total</td><td>one exact inverse STFT</td></tr>
+<tr><td>cost per second</td><td>16 000 predictions</td><td>100 frames</td></tr>
+<tr><td>needs a GAN?</td><td>yes, or it sounds muffled</td><td>no — good without, better with</td></tr>
+</table>
+</div>
+
+<p>The insight behind the spectral family is that the hard part was never "make
+a waveform". The ISTFT does that <em>exactly</em>, for free, and has since 1977.
+The hard part was only ever "know the phase". So predict the phase, run the
+exact inverse, and stop paying a network to re-derive arithmetic we already
+have.</p>
+
+<p>Three reasons it is the right choice for this repo specifically:</p>
+<ul>
+<li><strong>It shares Module 0's grid.</strong> n_fft 512, window 400, hop 160 —
+identical to <code>src/audio/features.py</code>. The mels the Tacotron already
+emits drop straight in, with no retraining of Module 4.</li>
+<li><strong>It is affordable.</strong> Roughly two orders of magnitude less
+compute per second of audio, which is what matters when the target is a laptop
+CPU inside a turn-taking latency budget.</li>
+<li><strong>It degrades gracefully.</strong> Trained on a multi-resolution STFT
+loss alone, with no discriminators, it already clears Griffin-Lim. Adversarial
+training becomes a later quality upgrade rather than a prerequisite — so there
+is a working artifact at every stage, instead of only at the end.</li>
+</ul>
+
+<h2><span class="num">11.3</span>The architecture</h2>
+<div class="diagram">log-mel (B, T, 80)
+   │
+   ▼  <span class="a">Conv1d(80 → d, k=7)</span> + LayerNorm
+   │
+   ▼  <span class="b">N × ConvNeXt block</span>       <span class="m">depthwise k=7 → LN → Linear(d,3d) → GELU → Linear(3d,d) → ·γ</span>
+   │
+   ▼  <span class="c">Linear(d → 2·257)</span>        <span class="m">split: log-magnitude | phase angle</span>
+   │
+   ▼  S = exp(mag) · e^(i·phase)
+   │
+   ▼  <span class="g">exact inverse STFT</span>        <span class="m">overlap-add, no learning</span>
+waveform (B, T·160 + 240)</div>
+
+<p>No attention. A vocoder needs a receptive field of a few tens of
+milliseconds — enough to place a glottal pulse — not a sentence. Convolutions
+supply that far more cheaply, which is why every production vocoder is
+convolutional.</p>
+
+<p>Two details that are not decoration:</p>
+<ul>
+<li><strong>Predict LOG magnitude.</strong> Spectra span ~120 dB. A linear head
+either saturates on the quiet parts or explodes on the loud ones. The clamp at
+<code>log(1e3)</code> is a hard safety rail: one <code>exp(30)</code> produces
+<code>inf</code> and poisons the entire batch's gradients — tested by
+<code>test_magnitude_clamp_prevents_inf</code>.</li>
+<li><strong>Layer scale γ initialised near zero.</strong> Each ConvNeXt block
+starts as approximately the identity, which is what lets a deep stack train
+stably without warmup tricks.</li>
+</ul>
+
+<h2><span class="num">11.4</span>The inverse STFT has to be exact</h2>
+<p>The whole premise is that the network only has to learn phase. If the
+overlap-add is even slightly lossy, the model spends its capacity compensating
+for our arithmetic instead, and every quality number measures the wrong thing.
+So the reconstruction is asserted to <strong>machine precision</strong>
+(measured: 8.9 × 10⁻⁸).</p>
+
+<p>Module 4's <code>istft</code> loops over frames in Python — fine for
+synthesising one utterance, hopeless inside a training step. The fast version
+uses <code>F.fold</code>, which is the transpose of the <code>unfold</code> that
+created the frames — and the transpose of framing <em>is</em> overlap-add. One
+fused, differentiable op instead of a loop. A test asserts the two agree, so the
+optimisation is provably not a behaviour change.</p>
+
+<h2><span class="num">11.5</span>The loss, and the term that is deliberately absent</h2>
+<p>Multi-resolution STFT distance at three window sizes (512/1024/256). A single
+resolution is a trap: a short window has good time resolution and poor frequency
+resolution, so a model trained on it gets pitch subtly wrong; a long window is
+the reverse and smears transients. Three at once leaves an error nowhere to
+hide.</p>
+<p>Per resolution, two complementary terms:</p>
+<ul>
+<li><strong>Spectral convergence</strong> ‖|S|−|Ŝ|‖<sub>F</sub> / ‖|S|‖<sub>F</sub>
+— relative, so it is dominated by loud, high-energy regions.</li>
+<li><strong>Log-magnitude L1</strong> — the reverse: log compresses the range so
+quiet detail (breath, fricatives, decay tails) gets a vote.</li>
+</ul>
+
+<div class="callout">
+<span class="label">There is no phase term. That's the design.</span>
+Nothing in the loss supervises phase directly. The model is free to choose
+<em>any</em> phase that makes the magnitudes come out right <em>after</em>
+overlap-add — and since overlapping frames share 240 of their 400 samples, only
+mutually consistent phase fields survive that constraint. Consistency emerges
+from the ISTFT's own redundancy rather than being imposed. Supervising raw phase
+angles directly is famously ineffective anyway: phase is circular, so
+<code>0.01</code> and <code>2π−0.01</code> are adjacent but look maximally far
+apart to an L1 loss.
+</div>
+
+<h2><span class="num">11.6</span>The experiment</h2>
+<p><code>scripts/12_train_vocoder.py</code> is deliberately airtight: both
+vocoders receive the <strong>exact same log-mel</strong> of a held-out utterance
+and must produce a waveform. Nothing else differs, so any gap is attributable to
+phase modelling and nothing else.</p>
+<div class="callout warn">
+<span class="label">I picked a rigged metric, and the measurement caught it</span>
+The first version of this experiment reported only multi-resolution STFT
+distance — the training loss. The reasoning was that Griffin-Lim does not train,
+so neither side gains an advantage. <strong>That reasoning is wrong.</strong>
+Griffin-Lim's entire algorithm is "iterate until the magnitudes are consistent",
+and MR-STFT distance is a <em>magnitude</em> metric. Scoring the two vocoders on
+it asks Griffin-Lim how well it did at its own objective, while being nearly
+blind to the one thing it gets wrong — the phase. The fix is to report a
+time-domain metric alongside it, where a wrong phase cannot hide: SI-SDR.
+</div>
+
+<h3>Result after 12 000 steps (1.55M params, dev-clean, no discriminators)</h3>
+<div class="tablewrap">
+<table>
+<tr><th>vocoder</th><th>mr-stft (magnitude) ↓</th><th>SI-SDR (phase-sensitive) ↑</th></tr>
+<tr><td>Griffin-Lim, 60 iters, 0 params</td><td><strong>0.858</strong></td><td>−37.6 dB</td></tr>
+<tr><td>ISTFT vocoder, 1.55M params</td><td>1.010</td><td><strong>−32.2 dB</strong></td></tr>
+</table>
+</div>
+
+<p>Exactly the split the theory predicts. Griffin-Lim wins on magnitude, because
+that is what it optimises. The neural vocoder wins by <strong>5.4 dB on
+SI-SDR</strong>, because it predicts phase rather than guessing it — which is
+the entire thesis of the module.</p>
+
+<p><strong>But the quality claim is not yet earned.</strong> −32 dB SI-SDR is
+poor in absolute terms, and losing on magnitude means this model is simply
+undertrained: 12 000 steps on 1-second crops with a 1.55M model against Vocos's
+~1M steps with discriminators. What is verified here is the <em>pipeline and the
+architecture</em> — exact ISTFT, correct gradients, the predicted phase advantage
+appearing on the metric that can see it. Turning that into audible superiority
+needs a longer run and adversarial training, which is a GPU job rather than a
+laptop one.</p>
+
+<p>The script also writes <code>outputs/12_true.wav</code>,
+<code>12_neural.wav</code> and <code>12_griffinlim.wav</code>. For a vocoder,
+listening is the evaluation that actually counts; the numbers exist to stop you
+fooling yourself between listens.</p>
+
+<h2><span class="num">11.7</span>What this still isn't</h2>
+<ol>
+<li><strong>No discriminators.</strong> The multi-period and multi-scale
+discriminators from HiFi-GAN are what take a vocoder from "clearly better than
+Griffin-Lim" to "indistinguishable from the original". They are the next
+upgrade, and they are why real vocoder training is slow.</li>
+<li><strong>16 kHz.</strong> Modern TTS ships 24 kHz or 44.1 kHz; our whole
+pipeline is 16 kHz because that is what ASR wants.</li>
+<li><strong>Trained on read speech.</strong> LibriSpeech only. Singing,
+whispering and heavy emotion are out of distribution.</li>
+<li><strong>Still a two-stage TTS.</strong> Mel is an information bottleneck
+between the acoustic model and the vocoder. Codec-LM systems (Orpheus,
+Chatterbox) remove that seam entirely — see <a href="08-sota.html">§8.5</a>.</li>
+</ol>
+
+<h2><span class="num">11.8</span>Using it</h2>
+<pre><code># train (dev-clean is enough to beat Griffin-Lim; more data still helps)
+uv run python scripts/12_train_vocoder.py
+STEPS=20000 DIM=256 BLOCKS=8 uv run python scripts/12_train_vocoder.py
+SPLIT=train-clean-100 DOWNLOAD=1 STEPS=40000 uv run python scripts/12_train_vocoder.py
+
+# then listen to the A/B it writes
+open outputs/12_griffinlim.wav outputs/12_neural.wav outputs/12_true.wav</code></pre>
+
+<p>Because it consumes the same 80-mel grid as everything else in the repo, the
+vocoder is not TTS-specific: anything that produces a Module 0 log-mel can be
+turned back into audio with it.</p>
+
+</main>
+<footer class="nav">
+  <a href="10-modern-asr.html">← The modern recognizer</a>
+  <a href="index.html">Back to the hub →</a>
+</footer>
+</body>
+</html>

@@ -27,10 +27,30 @@ class PipelineConfig(BaseSettings):
     # the alternatives are what production deployments actually run. Swap per
     # stage and A/B them on the same mic audio:
     #   VOICE_ASR_ENGINE=whisper VOICE_TTS_ENGINE=kokoro uv run python -m server.app
+    denoise_engine: str = "spectral"  # none | spectral (yours) | gtcrn | dtln
     vad_engine: str = "scratch"      # scratch (your VADNet) | silero
-    asr_engine: str = "scratch"      # scratch (your CTC BiGRU) | whisper
+    asr_engine: str = "scratch"      # scratch (CTC BiGRU) | conformer | whisper
     tts_engine: str = "scratch"      # scratch (your Tacotron-mini + Griffin-Lim) | kokoro
     responder: str = "echo"          # echo | claude | openai
+
+    # ---- noise suppression (Module 5) ----
+    # target: "both" = VAD and ASR both consume the cleaned stream;
+    #         "vad"  = only the VAD is scored on clean audio, the ASR receives
+    #                  the sample-aligned original.
+    # Default is "vad" because that's what scripts/10_denoise_bench.py measured:
+    #   VAD  — every engine helps at every SNR (room noise P 0.054 -> 0.040,
+    #          babble 0.51 -> 0.43, hum 0.010 -> 0.005; speech stays ~0.89).
+    #   ASR  — inconsistent, and negative exactly where it matters. Whisper
+    #          base.en CER on 24 utterances at 0 dB SNR: 0.068 raw, 0.079 with
+    #          the spectral front-end, 0.070 with GTCRN.
+    # Take the certain win, skip the uncertain loss. Set "both" if you run the
+    # scratch ASR (trained on clean LibriSpeech, so it prefers clean input) or
+    # if you need cleaned audio downstream for recording/LLM context.
+    denoise_target: str = "vad"      # both | vad
+    # Gain floor: how many dB a noise-only band may be attenuated. Unlimited
+    # suppression sounds cleaner to a human but strips the noise floor that
+    # ASR models expect, and makes silences pump.
+    denoise_atten_db: float = 18.0
 
     # ---- LLM responder (used when responder != "echo") ----
     # API keys come from the environment or .env — never from code/git.
@@ -46,6 +66,16 @@ class PipelineConfig(BaseSettings):
     scratch_vad_ckpt: str = "auto"
     scratch_asr_ckpt: str = "outputs/asr_libri.pt"
     scratch_tts_ckpt: str = "outputs/tts.pt"
+
+    # ---- Module 6: the modern (Conformer) recognizer ----
+    conformer_ckpt: str = "outputs/asr_conformer.pt"
+    # "" = read the tokenizer path recorded inside the checkpoint.
+    conformer_tokenizer: str = ""
+    # Decoder context in 40 ms encoder frames. 0 = offline (best WER);
+    # 16 = 640 ms lookahead. This is THE latency/accuracy dial of a streaming
+    # recognizer, and it needs no retraining because the model was trained with
+    # dynamic chunk masking.
+    conformer_chunk: int = 0
 
     # ---- audio format (the contract with the client) ----
     sample_rate: int = 16_000        # Hz; everything upstream of TTS is 16 kHz mono

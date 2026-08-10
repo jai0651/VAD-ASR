@@ -11,11 +11,11 @@ We build in small, runnable steps. Every module has a script you can run and *se
 ## The mental model
 
 ```
-                     ┌──────────────── the full loop ───────────────┐
-mic audio ─▶ VAD ─▶ endpointing ─▶ ASR ─▶ "brain" ─▶ TTS ─▶ speaker
-             │          │            │                 │
-         Module 1   Module 3     Module 2         Module 4
-        "speech?"  "turn done?" "what words?"   "say it back"
+                       ┌─────────────── the full loop ───────────────┐
+mic ─▶ denoise ─▶ VAD ─▶ endpointing ─▶ ASR ─▶ "brain" ─▶ TTS ─▶ speaker
+         │         │          │            │                 │
+     Module 5  Module 1   Module 3     Module 2         Module 4
+     "cleaner" "speech?"  "turn done?" "what words?"   "say it back"
 
   Module 0 (features) feeds everything; Module 3 is also the production
   pipeline: streaming server, orchestrator, barge-in, metrics.
@@ -35,6 +35,9 @@ becomes a product.
 | **2. ASR** | Char-level speech recognizer | CTC loss, alignment problem, greedy + beam decoding |
 | **3. Pipeline** | Real-time voice agent server | endpointing, orchestration, barge-in, WebSocket streaming, latency metrics, engine swapping |
 | **4. TTS** | Char-level speech synthesizer | seq2seq attention, guided attention, stop tokens, Griffin-Lim phase recovery |
+| **5. Noise suppression** | Streaming denoiser **from scratch** | STFT gain estimation, MCRA noise tracking, decision-directed SNR, log-MMSE / OM-LSA, why neural models won |
+| **6. Modern ASR** | Conformer + hybrid CTC/attention **from scratch** | BPE subwords, relative-position attention, macaron blocks, dynamic chunk streaming, SpecAugment, warmup/cosine, checkpoint averaging |
+| **7. Neural vocoder** | ISTFT vocoder (Vocos-style) **from scratch** | why Griffin-Lim is a ceiling, ConvNeXt blocks, magnitude+phase heads, exact overlap-add via `fold`, multi-resolution STFT loss |
 
 ## Setup
 
@@ -55,7 +58,26 @@ uv run python scripts/09_train_vad_real.py  # VAD retrained on REAL audio (-> va
 uv run python scripts/07_vocoder_roundtrip.py # hear Griffin-Lim invert your mels
 uv run python scripts/08_train_tts.py     # train the TTS (-> outputs/tts.pt)
 uv run python scripts/06_pipeline_e2e.py  # full VAD->ASR->TTS pipeline, no mic
+uv run python scripts/10_denoise_bench.py # does noise suppression actually help?
+uv run python scripts/11_train_asr_conformer.py # the MODERN ASR (Module 6)
+uv run python scripts/12_train_vocoder.py # neural vocoder vs Griffin-Lim (Module 7)
+uv run python scripts/13_asr_compare.py   # Module 2 vs Module 6 vs Whisper, same audio
 ```
+
+### Does the modern architecture actually help? (`scripts/13_asr_compare.py`)
+
+Same 40 held-out utterances, same 4.1 h of training audio for both scratch models:
+
+| engine | WER | CER | RTF | training data |
+|---|---|---|---|---|
+| scratch (Module 2) — BiGRU + CTC + chars | 1.076 | 0.658 | 0.011 | 4.1 h |
+| **conformer (Module 6)** — offline | **0.607** | **0.276** | **0.004** | 4.1 h |
+| conformer (Module 6) — streaming, 640 ms | 0.627 | 0.284 | 0.004 | 4.1 h |
+| whisper base.en int8 | 0.033 | 0.017 | 0.052 | ~680,000 h |
+
+The architecture change halved the error on identical data, made it 2.7× faster,
+and added streaming for a 3% relative cost. The remaining 18× gap to Whisper is
+165,000× more data — which is exactly the point of Module 6.
 
 Each writes a plot or wav to `outputs/`. Open them to *see/hear* what each stage does.
 
@@ -82,9 +104,32 @@ VOICE_ASR_ENGINE=whisper uv run python -m server.app
 
 | slot | `scratch` (default: yours) | production alternative |
 |------|---------------------------|------------------------|
+| denoise | Module 5 OM-LSA spectral suppressor | `gtcrn` (23.7K params) / `dtln` — trained onnx |
 | vad  | Module 1 VADNet           | `silero` — Silero VAD v5 (2 MB onnx) |
-| asr  | Module 2 CTC BiGRU + your beam search | `whisper` — faster-whisper (CTranslate2, int8) |
+| asr  | Module 2 CTC BiGRU + your beam search | `conformer` — Module 6 (streaming-capable) · `whisper` — faster-whisper (CTranslate2, int8) |
 | tts  | Module 4 Tacotron-mini + Griffin-Lim | `kokoro` — Kokoro-82M (onnx) |
+
+### Noise suppression (Module 5)
+
+On by default (`VOICE_DENOISE_ENGINE=spectral`), feeding cleaned audio to the
+VAD only. Measured on this repo with `scripts/10_denoise_bench.py`:
+
+| engine | ΔSNR | noise removed in pauses | speech damaged | RTF | latency |
+|--------|------|--------------------------|----------------|-----|---------|
+| `spectral` (yours) | +5.3 dB | 8.1 dB | 0.9 dB | 0.004 | 16 ms |
+| `gtcrn` | +4.9 dB | 7.3 dB | 2.0 dB | 0.031 | 16 ms |
+| `dtln` | +6.9 dB | 7.9 dB | 1.1 dB | 0.015 | 24 ms |
+
+```bash
+bash scripts/fetch_denoise_models.sh                 # only for gtcrn/dtln
+uv run python scripts/10_denoise_bench.py            # measure it yourself
+WHISPER=1 SNR_DB=0 uv run python scripts/10_denoise_bench.py
+VOICE_DENOISE_ENGINE=gtcrn uv run python -m server.app
+```
+
+`denoiser/` is the standalone realtime denoiser app (mic → clean → virtual
+audio device, for Zoom/Meet/a softphone). It has its own venv and README; the
+`src/denoise/` engines above are the same idea integrated into this pipeline.
 
 ### Add the LLM brain
 
@@ -120,10 +165,18 @@ Run the tests: `uv run pytest -q` (endpointing, orchestrator/barge-in, audio I/O
 | `src/vad/stream.py` | streaming inference + hysteresis smoothing |
 | `src/asr/text.py` | char vocabulary + the CTC collapse rule |
 | `src/asr/data.py` | synthetic "spoken text" generator |
-| `src/asr/model.py` | conv + BiGRU CTC encoder |
+| `src/asr/model.py` | conv + BiGRU CTC encoder (Module 2) |
 | `src/asr/decode.py` | greedy + CTC prefix beam search + CER |
+| `src/asr/tokenizer.py` | BPE subword tokenizer, trained from the transcripts |
+| `src/asr/conformer.py` | Conformer encoder: rel-pos attention, macaron FFN, chunk masks |
+| `src/asr/hybrid.py` | hybrid CTC/attention model + attention rescoring |
+| `src/asr/corpus.py` | SpecAugment, speed perturb, CMVN, dynamic batching |
+| `src/asr/search.py` | log-space CTC prefix beam over subwords + WER |
 | `src/tts/model.py` | Tacotron-mini: attention seq2seq text→mel |
 | `src/tts/vocoder.py` | Griffin-Lim + hand-built STFT/ISTFT (mel→audio) |
+| `src/denoise/spectral.py` | MCRA + decision-directed + log-MMSE/OM-LSA denoiser, by hand |
+| `src/denoise/onnx_engines.py` | GTCRN / DTLN streaming denoisers (production alternates) |
+| `src/pipeline/denoise.py` | the denoise stage + which stages consume clean audio |
 | `src/pipeline/endpointing.py` | turn detection state machine |
 | `src/pipeline/orchestrator.py` | the voice-agent session (barge-in lives here) |
 | `src/pipeline/scratch_engines.py` | YOUR models behind the pipeline interfaces |
@@ -133,8 +186,12 @@ Run the tests: `uv run pytest -q` (endpointing, orchestrator/barge-in, audio I/O
 ## Learn the deep internals (docs/)
 
 Open `docs/index.html` — a set of deep-dive pages written alongside this code:
-pipeline architecture, VAD, ASR, TTS, production inference, and a decision log
-recording *why* each design choice was made (and what production does instead).
+pipeline architecture, VAD, ASR, TTS, noise suppression, production inference,
+a decision log recording *why* each design choice was made — plus
+`docs/08-sota.html` (what the state of the art actually is in 2026, why those
+architectures won, and how close from-scratch models can get) and
+`docs/09-turn-detection.html` (a concrete plan for an open model that beats the
+current best where it is weakest).
 
 ## Real speech (LibriSpeech)
 

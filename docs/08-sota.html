@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>8 · State of the Art (2026) — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>State of the <span>Art</span></h1>
+  <p>What the best open models actually are in August 2026, why those
+     architectures won, an honest accounting of the gap between them and the
+     models in this repo — and what it would really take to close it.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← hub</a> · <a href="07-denoise.html">denoise</a></div>
+
+<h2><span class="num">8.1</span>The scoreboard</h2>
+<p>One row per stage: what this repo runs, what the best open model is, and —
+the only column that matters for planning — <strong>what kind of gap it is</strong>.</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>stage</th><th>this repo (scratch)</th><th>best open, Aug 2026</th><th>the gap is mostly…</th></tr>
+<tr>
+  <td><strong>Denoise</strong></td>
+  <td>OM-LSA, 0 params</td>
+  <td>GTCRN (23.7K), LiSenNet (37K), ULCNet / Fast-ULCNet</td>
+  <td><span class="pill">architecture</span> gain-only masking has a hard ceiling</td>
+</tr>
+<tr>
+  <td><strong>VAD</strong></td>
+  <td>VADNet, 3×Conv1d, ~55K params</td>
+  <td>TEN VAD, Silero v5</td>
+  <td><span class="pill">data</span> the architecture is already the right shape</td>
+</tr>
+<tr>
+  <td><strong>Turn-taking</strong></td>
+  <td>fixed 700 ms silence timeout</td>
+  <td>Smart Turn v3.x (8M), LiveKit turn-detector</td>
+  <td><span class="pill">problem framing</span> it's a different model, not a better threshold</td>
+</tr>
+<tr>
+  <td><strong>ASR</strong></td>
+  <td>CTC BiGRU, ~2M params, chars, no LM</td>
+  <td>Parakeet TDT 0.6B v3, Whisper large-v3-turbo, Qwen3-ASR</td>
+  <td><span class="pill">everything</span> arch + objective + data + scale</td>
+</tr>
+<tr>
+  <td><strong>TTS</strong></td>
+  <td>Tacotron-mini + Griffin-Lim</td>
+  <td>Kokoro-82M, Chatterbox(-Turbo), Orpheus, F5/flow-matching family</td>
+  <td><span class="pill">architecture</span> Griffin-Lim caps quality regardless of data</td>
+</tr>
+</table>
+</div>
+
+<div class="callout">
+<span class="label">Read this first</span>
+"Is the only difference the training data?" — <strong>no, and the answer is
+different per stage.</strong> For the VAD it is almost entirely data (this repo
+proved it: Module 1b changed <em>only</em> the data and fixed the live bug with
+an unchanged architecture). For TTS and denoising it is almost entirely
+architecture — Griffin-Lim cannot estimate phase and a real-valued gain cannot
+correct it, so infinite data buys you a better-sounding <em>ceiling-limited</em>
+model. For ASR it is genuinely everything at once, and that is why ASR is the
+expensive one.
+</div>
+
+<h2><span class="num">8.2</span>Denoise: why 24K parameters beat 20 years of statistics</h2>
+<p><a href="07-denoise.html">Module 5</a> measured the classical algorithm as
+competitive on <em>stationary</em> noise. The architectural leap is about
+everything else.</p>
+
+<h3>What the learned models add</h3>
+<ul>
+<li><strong>Recognition instead of stationarity.</strong> MCRA assumes noise is
+stable enough that its running minimum estimates the floor. True for fans, hiss
+and hum; completely false for a door slam, a keyboard, a dog, another person
+talking — the noises that actually ruin calls. A trained model has seen
+thousands of hours of those and identifies them by their time-frequency
+<em>shape</em>.</li>
+<li><strong>Complex masks.</strong> GTCRN estimates a complex-valued mask, so it
+corrects phase. No gain-only method can, at any parameter count. This is the
+hard ceiling on <code>spectral.py</code>.</li>
+<li><strong>Capacity in the right places.</strong> GTCRN gets Krisp-class quality
+from <strong>23.7K parameters and 39.6 MMACs/s</strong> using grouped convolutions, sub-band feature
+extraction and a dual-path RNN across the frequency axis. Enhancement is a
+per-bin regression with strong local structure; it needs the right inductive
+bias, not scale. For comparison, ULCNet matches DeepFilterNet2 subjectively at
+~25% of its complexity, and Fast-ULCNet halves that again by swapping GRUs for
+FastGRNNs.</li>
+<li><strong>Streaming as an architectural property.</strong> GTCRN and DTLN carry
+explicit caches frame-to-frame, so each hop is exactly one forward pass.
+DeepFilterNet3 doesn't, which is why real-time DFN is a Rust library and why the
+<code>denoiser/</code> sub-project has to re-process 200 ms of context every hop
+to use it — 23% of a core versus 3%.</li>
+</ul>
+
+<h3>What to actually ship</h3>
+<p>16 kHz voice agents: <strong>GTCRN</strong>. 48 kHz consumer audio:
+DeepFilterNet3. Ultra-constrained embedded: ULCNet-class. And measure the ASR
+effect before you enable it globally — <a href="07-denoise.html">§7.5</a>.</p>
+
+<h2><span class="num">8.3</span>VAD and the thing that replaced it</h2>
+<h3>Frame VAD is a solved, tiny problem</h3>
+<p>Both leaders are small models over log-mel-ish features with recurrent state.
+<strong>Silero v5</strong> is ~2 MB, 32 ms windows, and its moat is data — ~100
+languages and thousands of hours of hard negatives (music, keyboard, babble).
+<strong>TEN VAD</strong> is the 2026 challenger: better precision at lower compute
+and memory, and — the part that matters for agents — much faster
+speech→non-speech transition detection, where Silero is known to lag by a few
+hundred milliseconds. In a turn-taking budget, several hundred ms of VAD lag is
+not a rounding error; it is most of your responsiveness budget.</p>
+
+<div class="callout prod">
+<span class="label">Our result, restated</span>
+Module 1b changed nothing but the data and turned a VAD that pinned P≈1 on room
+ambience into one that reads 0.01–0.04 on noise and 0.78 on speech. The
+architecture in <code>src/vad/model.py</code> — three conv layers over log-mel —
+is genuinely the right shape. The remaining soft spots (babble 0.50, quiet
+speech 0.47) are also data problems, and <a href="07-denoise.html">Module 5</a>
+just moved babble to 0.39 with no retraining at all.
+</div>
+
+<h3>The real 2026 state of the art is not VAD at all</h3>
+<p>A fixed silence timeout — what <code>src/pipeline/endpointing.py</code>
+implements — forces an unwinnable trade: 500 ms cuts people off mid-thought,
+900 ms feels laggy. The fix is not a better threshold; it's a different
+question. <strong>Semantic / audio-native turn detection</strong> asks "does this
+person expect me to reply <em>now</em>?" from prosody and syntax — falling pitch
+and a completed clause mean go, a held vowel or "my number is four two…" means
+wait.</p>
+<ul>
+<li><strong>Smart Turn v3.x</strong> (Pipecat/Daily) — a Whisper-tiny encoder plus
+a linear classifier, ~8M params, 8 MB int8 ONNX, ~12 ms on a modern CPU. BSD-2
+with <em>open weights, open training code and open datasets</em> — which is
+exactly why it's the right thing to build against. v3.1 added real human audio
+over synthetic; v3.2 added short-utterance handling and café/office noise.</li>
+<li><strong>LiveKit turn-detector</strong> — the transcript-conditioned school:
+run the text through a small LM and ask whether the utterance is complete.
+Cheaper to train, but it inherits ASR latency and loses all prosody.</li>
+</ul>
+<p>This repo has neither. That's the honest gap in the pipeline — and it is also
+the most attackable one, which is the whole subject of
+<a href="09-turn-detection.html">§9</a>.</p>
+
+<h2><span class="num">8.4</span>ASR: four architectural eras, and where ours sits</h2>
+
+<div class="diagram">1. <span class="m">HMM-GMM + pronunciation lexicon</span>        pre-2014, hand-built pipeline
+2. <span class="a">CTC</span>  encoder → per-frame labels           DeepSpeech · <span class="w">← this repo</span>
+3. <span class="b">RNN-T / TDT</span>  encoder + prediction net    Parakeet · streaming-native
+4. <span class="c">attention enc-dec</span> / speech-LLM          Whisper · Qwen3-ASR · Voxtral</div>
+
+<h3>Why CTC was superseded</h3>
+<p>CTC's defining assumption is <strong>conditional independence</strong>: given the
+audio, each output frame's label is predicted independently of the others. That
+is what makes the dynamic-programming loss tractable, and it is why our decoder
+needs a beam search (and really wants a language model) to produce spellable
+English. The model has no internal notion of "having just emitted a Q, a U is
+likely". <strong>RNN-Transducer</strong> fixes exactly this by adding a prediction
+network over the output history — a built-in LM — while keeping strict
+monotonic, streaming-friendly alignment. <strong>TDT</strong> (Token-and-Duration
+Transducer) then lets the model emit a token <em>and</em> a duration in one step,
+so it skips frames instead of emitting blanks; that's the trick behind Parakeet's
+extraordinary throughput.</p>
+
+<h3>The 2026 options, honestly compared</h3>
+<div class="tablewrap">
+<table>
+<tr><th>model</th><th>arch</th><th>where it wins</th><th>where it loses</th></tr>
+<tr><td><strong>Parakeet TDT 0.6B v3</strong></td><td>FastConformer + TDT</td>
+    <td>6.32% WER on the HF Open-ASR leaderboard vs Whisper large-v3's 7.44%, at ¼ the size and enormous throughput (~3300× real time). Streaming-native.</td>
+    <td>25 European languages only. Weaker on heavy accents and unseen domain vocabulary.</td></tr>
+<tr><td><strong>Whisper large-v3-turbo</strong></td><td>attention enc-dec, decoder pruned 32→4 layers</td>
+    <td>99+ languages, robust to accents and messy audio, ~6× faster than large-v3 at 809M params.</td>
+    <td>Not streaming (30 s windows). Hallucinates on silence. Decoder is the latency floor.</td></tr>
+<tr><td><strong>Qwen3-ASR / speech-LLM family</strong></td><td>audio encoder → LLM decoder</td>
+    <td>Context and instructions: bias toward a vocabulary, follow formatting rules, do ASR+translation+understanding in one model.</td>
+    <td>Heavyweight; latency and cost profile of an LLM.</td></tr>
+<tr><td><strong>this repo</strong></td><td>2×Conv1d + 2-layer BiGRU + CTC</td>
+    <td>You can read all of it in one sitting and it explains the alignment problem exactly.</td>
+    <td>CER ~0.58–0.68 on held-out audio. <em>Bidirectional</em>, so it cannot stream at all.</td></tr>
+</table>
+</div>
+
+<h3>What would actually have to change here</h3>
+<p>This is the stage where "just add data" is wrong. In rough order of impact:</p>
+<ol>
+<li><strong>The encoder.</strong> BiGRU → Conformer (conv for local phonetics +
+self-attention for long context). Roughly 12 layers, d_model 256, 4 heads,
+conv kernel 31, subsampling ×4. This alone is most of the modern-ASR quality
+jump and is ~15M params — trainable on an M4.</li>
+<li><strong>Causality.</strong> Bidirectional means the model waits for the whole
+utterance. Chunked/limited-context attention or a unidirectional encoder is
+mandatory for a real agent.</li>
+<li><strong>The objective.</strong> CTC → hybrid CTC+attention (train both heads,
+use CTC for alignment and fast decoding) or RNN-T if you want true streaming.</li>
+<li><strong>Tokens.</strong> Characters → a 256–1024-entry SentencePiece
+vocabulary. Fewer decoder steps, better implicit spelling.</li>
+<li><strong>Augmentation.</strong> SpecAugment is not optional; it is worth more
+than doubling the data on small corpora.</li>
+<li><strong>Data.</strong> <em>Then</em> data. dev-clean subset → train-clean-100
+→ train-960 → the open corpora in §8.8.</li>
+</ol>
+
+<h2><span class="num">8.5</span>TTS: three eras, and why Griffin-Lim is the wall</h2>
+<div class="diagram">1. <span class="a">autoregressive + attention</span>   Tacotron 2 · <span class="w">← this repo</span>   attention CAN break
+2. <span class="b">non-autoregressive + duration</span>  FastSpeech 2 · robust, fast, flat prosody
+3. <span class="c">generative</span>: diffusion / flow-matching / codec-LM   natural prosody, zero-shot cloning</div>
+
+<p>Our Tacotron-mini is era 1 and hits every one of era 1's known failures:
+exposure bias, attention stalls, and a stop head that has to be guarded with
+heuristics. Era 2 removed the failure mode entirely by predicting a
+<em>duration</em> per token and expanding — no attention to break. Era 3 treats
+speech as a generative problem: flow-matching over mel (F5-TTS style) or an LM
+over neural-codec tokens (Orpheus, Chatterbox), which is what unlocked
+5-second zero-shot voice cloning and genuinely expressive prosody.</p>
+
+<div class="callout warn">
+<span class="label">The ceiling that data cannot lift</span>
+Our vocoder is <strong>Griffin-Lim</strong>: it iteratively guesses the phase that
+was thrown away when we took magnitudes. It is a beautiful thing to implement and
+it is a hard quality ceiling. A neural vocoder (HiFi-GAN, Vocos) or a codec
+decoder is a <em>learned</em> mel→waveform map and is the single biggest
+perceptual upgrade available to Module 4 — bigger than any amount of extra
+training data for the acoustic model.
+</div>
+
+<h3>The 2026 options</h3>
+<div class="tablewrap">
+<table>
+<tr><th>model</th><th>size</th><th>use it when</th></tr>
+<tr><td><strong>Kokoro-82M</strong></td><td>82M</td><td>Voice agents and edge. Runs on CPU, minimal latency, ~54 preset voices, no cloning. What this repo uses as the production alternate — and still the right default for a latency-bound agent.</td></tr>
+<tr><td><strong>Chatterbox / Chatterbox-Turbo</strong></td><td>~500M / 350M</td><td>You need voice cloning from ~5 s of audio and human-preferred quality (blind tests put it ahead of ElevenLabs at ~64% preference). Turbo is the one that fits a live latency budget.</td></tr>
+<tr><td><strong>Orpheus</strong></td><td>3B</td><td>Maximum expressiveness and you have 8–12 GB of VRAM to spare. Autoregressive: the moment it spills out of VRAM the speed collapses.</td></tr>
+</table>
+</div>
+
+<h2><span class="num">8.6</span>Cascade vs. end-to-end speech-to-speech</h2>
+<p>The pipeline in this repo — <em>denoise → VAD → endpoint → ASR → LLM →
+TTS</em> — is a <strong>cascade</strong>, and cascades are still what almost every
+production voice agent ships. Their weakness is structural: they are
+turn-based, they throw away everything non-lexical (tone, hesitation, emotion)
+at the ASR boundary, and their latency is a sum.</p>
+<p>Full-duplex speech-to-speech models (Moshi, and the Thinker-Talker family like
+Qwen3-Omni) model the user's speech and the system's speech as parallel streams,
+so overlap, backchannels and interruptions are native rather than bolted on.
+Reported response latencies sit around 200–260 ms versus the ~800 ms+ a good
+cascade achieves.</p>
+<div class="callout prod">
+<span class="label">Why cascades still win in production</span>
+Control. You can swap the LLM, enforce a system prompt, log a transcript, run
+compliance checks, hot-fix a pronunciation, and bill per stage. End-to-end
+models give up most of that. The pragmatic 2026 architecture is a cascade with
+the turn-taking layer upgraded to an audio-native model — which is precisely the
+gap <a href="09-turn-detection.html">§9</a> targets.
+</div>
+
+<h2><span class="num">8.7</span>So what <em>is</em> the difference between ours and production?</h2>
+<p>Five distinct gaps. Naming them separately is what makes the plan tractable.</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>gap</th><th>what it means</th><th>who it bites hardest here</th></tr>
+<tr><td><strong>1. Data</strong></td><td>hours, speakers, languages, channels, and above all <em>hard negatives</em></td><td>VAD (fixed by Module 1b), turn detection</td></tr>
+<tr><td><strong>2. Scale</strong></td><td>parameters and compute; 2M vs 600M is three orders of magnitude of capacity</td><td>ASR</td></tr>
+<tr><td><strong>3. Architecture</strong></td><td>the inductive bias: complex masks, transducers, flow matching, neural vocoders</td><td>TTS, denoise, ASR</td></tr>
+<tr><td><strong>4. Training recipe</strong></td><td>augmentation, LR schedule, tokenisation, curriculum, checkpoint selection</td><td>everything — and it's the cheapest to fix</td></tr>
+<tr><td><strong>5. Inference engineering</strong></td><td>ONNX/CTranslate2, int8, caching, batching, streaming</td><td>the difference between a demo and a service</td></tr>
+</table>
+</div>
+
+<p>Two measured facts from this repo make the point concretely.
+<strong>Recipe beats everything for cheapness:</strong> in both Module 1b and
+Module 4, selecting the checkpoint on the metric we cared about rather than
+taking the last one changed the shipped model materially — the VAD's best
+hard-case score was 0.806 at step 2750 while the final step scored 0.699, and
+the TTS judge oscillated 0.96 → 0.61 with three regressions along the way.
+<strong>Architecture beats data where there's a ceiling:</strong> no quantity of
+LibriSpeech makes Griffin-Lim estimate phase.</p>
+
+<h2><span class="num">8.8</span>Training on open data: the actual recipes</h2>
+
+<h3>The open corpora worth knowing (2026)</h3>
+<div class="tablewrap">
+<table>
+<tr><th>dataset</th><th>scale</th><th>good for</th></tr>
+<tr><td><strong>LibriSpeech</strong></td><td>960 h read English</td><td>the honest baseline; what this repo uses</td></tr>
+<tr><td><strong>People's Speech / Common Voice</strong></td><td>30k h / 20k+ h, many languages</td><td>accent and channel diversity</td></tr>
+<tr><td><strong>YODAS</strong></td><td>370k+ h, 100+ languages (English ~164k h)</td><td>scale, at the cost of noisy auto-transcripts</td></tr>
+<tr><td><strong>Granary</strong></td><td>643k+ h ASR / 351k+ h AST, 25 European languages</td><td>pseudo-labelled scale with a published cleaning pipeline</td></tr>
+<tr><td><strong>Emilia / Emilia-Large</strong></td><td>101k h → 216k h, spontaneous in-the-wild speech</td><td>TTS: the corpus that unlocked natural, non-read prosody</td></tr>
+<tr><td><strong>MUSAN / WHAM! / DNS Challenge</strong></td><td>noise + RIRs</td><td>augmentation and denoise training</td></tr>
+<tr><td><strong>IndicVoices</strong></td><td>~12k h, 22 languages, 22.5k speakers, 208 districts; extempore + conversational + code-switched</td><td>the Indian-language and code-switching gap</td></tr>
+<tr><td><strong>Kathbath / Shrutilipi</strong></td><td>1,684 h (12 langs, CC-BY-4.0) / 6,400+ h All-India-Radio broadcast</td><td>Indic ASR at usable licence terms</td></tr>
+<tr><td><strong>Smart Turn v3.x train/test</strong></td><td>open, on HuggingFace</td><td>turn detection — <em>and</em> the baseline to beat in §9</td></tr>
+</table>
+</div>
+
+<h3>Recipe A — a real ASR you could actually ship, on an M4</h3>
+<p>Target: WER in the low teens on LibriSpeech test-clean. Not Parakeet, but a
+genuine recogniser rather than a demo.</p>
+<ul>
+<li><strong>Model:</strong> Conformer encoder, 12 layers, d_model 256, 4 heads,
+FF 1024, conv kernel 31, ×4 subsampling → ~15M params.</li>
+<li><strong>Objective:</strong> hybrid CTC + attention decoder (λ ≈ 0.3 CTC).
+Train both; decode with CTC prefix beam + attention rescoring.</li>
+<li><strong>Tokens:</strong> SentencePiece unigram, vocab 256–512.</li>
+<li><strong>Data:</strong> train-clean-100 first (fast iteration), then train-960.</li>
+<li><strong>Augmentation:</strong> SpecAugment (2 freq masks ≤27 bins, 2 time
+masks ≤ 5% of frames), speed perturb 0.9/1.0/1.1, MUSAN noise at 5–20 dB SNR,
+RIR reverb on ~30%. On 100 h this is worth more than another 100 h.</li>
+<li><strong>Optimiser:</strong> AdamW, Noam/warmup-cosine, 10k warmup steps, peak
+LR 2e-3, weight decay 1e-2, grad clip 5.0, dynamic batching by total frames.</li>
+<li><strong>Precision:</strong> bf16 where MPS supports it; gradient accumulation
+to reach an effective batch of ~2–4 minutes of audio per step.</li>
+<li><strong>Selection:</strong> average the last ~10 checkpoints (a standard,
+nearly-free ~0.3 WER win) and select on held-out WER, never on loss.</li>
+<li><strong>Budget:</strong> days, not hours, on an M4 for train-960. Rent an
+A100 for a day if the goal is the number rather than the learning.</li>
+</ul>
+
+<h3>Recipe B — a TTS that clears the Griffin-Lim ceiling</h3>
+<ul>
+<li><strong>Step 1, biggest win:</strong> keep Tacotron-mini, replace Griffin-Lim
+with a pretrained neural vocoder (HiFi-GAN or Vocos) on the same 80-mel
+configuration. Days of work, an enormous perceptual jump, no retraining of the
+acoustic model.</li>
+<li><strong>Step 2:</strong> replace the attention decoder with a duration
+predictor (FastSpeech-style). Extract durations from your existing model's
+attention or from a forced aligner (MFA). Removes exposure bias and attention
+collapse permanently, and makes inference non-autoregressive → far lower TTFB.</li>
+<li><strong>Step 3:</strong> LJSpeech (24 h, single speaker) → VCTK (multi-speaker)
+→ an Emilia subset for spontaneous prosody.</li>
+<li><strong>Selection:</strong> keep the ASR-judge you already built — synthesise,
+transcribe with Whisper, select on CER. It caught three regressions in Module 4
+that loss curves did not.</li>
+</ul>
+
+<h3>Recipe C — a denoiser (train GTCRN-class yourself)</h3>
+<ul>
+<li><strong>Data:</strong> DNS Challenge synthesis — clean speech × noise × RIR
+mixed on the fly at −5…20 dB SNR. Generate mixtures per epoch rather than
+pre-baking; the augmentation space <em>is</em> the dataset.</li>
+<li><strong>Target:</strong> complex ratio mask or complex spectral mapping, not a
+magnitude mask. That's the whole point.</li>
+<li><strong>Loss:</strong> compressed-magnitude + complex MSE (power-law
+compression ≈0.3), optionally plus an SI-SDR term. Perceptual losses matter more
+here than in any other stage.</li>
+<li><strong>Eval:</strong> PESQ-WB, STOI, SI-SDR on VoiceBank-DEMAND — already
+implemented in <code>denoiser/evaluate.py</code>.</li>
+<li><strong>Feasible on an M4?</strong> Yes. 23.7K parameters. This is the most
+achievable "train a SOTA-class model yourself" target in the whole stack.</li>
+</ul>
+
+<h2><span class="num">8.9</span>The AI-engineering layer that closes the last mile</h2>
+<p>Model quality is roughly half of "best in class". The rest is this:</p>
+<ul>
+<li><strong>Build the eval set before the model.</strong> Not a benchmark — a set
+of the specific things that break. Module 1b's "hard cases" (zeros, hum, babble,
+quiet speech) took ten minutes to write and are the reason a shipped checkpoint
+was chosen correctly. A metric that reflects your product failure modes is worth
+more than a leaderboard.</li>
+<li><strong>Select checkpoints on that metric.</strong> "Last" is not "best". Both
+training runs in this repo showed edge-case behaviour oscillating while the loss
+curve sat flat.</li>
+<li><strong>Measure p50 <em>and</em> p95.</strong> Latency is long-tailed and users
+feel the tail. <code>src/pipeline/metrics.py</code> already decomposes the
+turnaround into endpoint wait + ASR + respond + TTS-first-chunk — that
+decomposition is what tells you which stage to fix.</li>
+<li><strong>Quantise and export.</strong> int8 ONNX / CTranslate2 is typically
+4× smaller and 2–3× faster for &lt;1% relative WER. Measured here: whisper
+base.en int8 runs at RTF 0.08 with CER 0.012 on dev-clean. Smart Turn ships
+8 MB int8 and runs in 12 ms.</li>
+<li><strong>Distil.</strong> Whisper large-v3-turbo is literally "keep the
+encoder, cut the decoder from 32 layers to 4" — a reminder that in
+encoder-decoder ASR the decoder is where the latency hides and where the
+compression is cheapest.</li>
+<li><strong>Streaming beats accuracy for perceived quality.</strong> First-token
+latency dominates user perception. A slightly worse model that starts speaking
+in 300 ms beats a better one that starts in 900 ms.</li>
+<li><strong>Log the audio you get wrong.</strong> The compounding advantage in
+voice AI is a labelled corpus of your own failures. Every open dataset is
+available to your competitors; your call recordings are not.</li>
+</ul>
+
+<h2><span class="num">8.10</span>Where a voice-AI company should actually invest</h2>
+<p>Ranked by defensibility per unit of effort, given that Parakeet, Whisper,
+Kokoro and GTCRN are all free:</p>
+<ol>
+<li><strong>Turn-taking on your channel.</strong> Everyone's models are trained on
+clean wideband mic audio. Telephony is 8 kHz μ-law, often transcoded twice.
+This is a real, narrow, measurable gap — see <a href="09-turn-detection.html">§9</a>.</li>
+<li><strong>Domain adaptation of an open ASR.</strong> Fine-tuning Parakeet or
+Whisper on your vertical's vocabulary (names, SKUs, addresses, code-switching)
+beats any general model on your traffic, for a fraction of pretraining cost.</li>
+<li><strong>The orchestration layer.</strong> Barge-in, endpointing policy,
+interruption recovery, backchannels, latency budgeting. Almost no papers, huge
+product impact — and it's the layer this repo builds fully.</li>
+<li><strong>Evaluation infrastructure.</strong> A replayable corpus of real calls
+with turn-level labels, so any model change is measurable in hours.</li>
+<li><strong>Pretraining a general ASR/TTS from scratch.</strong> Last. It is the
+most expensive way to reach parity with a free model.</li>
+</ol>
+
+<h3>Sources</h3>
+<p class="pill-row">
+<a href="https://huggingface.co/pipecat-ai/smart-turn-v3">Smart Turn v3</a> ·
+<a href="https://www.daily.co/blog/announcing-smart-turn-v3-with-cpu-inference-in-just-12ms/">Smart Turn v3 announcement</a> ·
+<a href="https://www.daily.co/blog/smart-turn-v3-2-handling-noisy-environments-and-short-responses/">v3.2</a> ·
+<a href="https://huggingface.co/TEN-framework/ten-vad">TEN VAD</a> ·
+<a href="https://github.com/snakers4/silero-vad">Silero VAD</a> ·
+<a href="https://northflank.com/blog/best-open-source-speech-to-text-stt-model-in-2026-benchmarks">open STT benchmarks 2026</a> ·
+<a href="https://arxiv.org/html/2601.14925">Fast-ULCNet</a> ·
+<a href="https://arxiv.org/html/2407.05361v1">Emilia</a> ·
+<a href="https://www.alphaxiv.org/overview/2505.13404v2">Granary</a> ·
+<a href="https://github.com/AI4Bharat/IndicVoices">IndicVoices</a> ·
+<a href="https://ai.ksopyla.com/posts/voice-to-voice-models-2026-review/">speech-to-speech architectures 2026</a>
+</p>
+
+</main>
+<footer class="nav">
+  <a href="07-denoise.html">← Noise suppression</a>
+  <a href="09-turn-detection.html">Next: Beating Smart Turn on telephony →</a>
+</footer>
+</body>
+</html>

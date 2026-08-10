@@ -1,0 +1,898 @@
+
+
+<title>How a Realtime Speech Denoiser Works</title>
+<style>
+  :root{
+    /* light "lab schematic" — chosen cool paper, not default grey */
+    --bg:#e9edf3; --surface:#ffffff; --surface-2:#f3f6fb; --border:#d2dae6;
+    --ink:#182130; --ink-muted:#54607a; --ink-faint:#8894ab;
+    --accent:#a9670c; --accent-soft:#c77d16; --accent-ink:#ffffff;
+    --pos:#1c9182; --neg:#cf5570; --grid:#e0e6f0;
+    --code-bg:#f3f6fb;
+    --mono:ui-monospace,"SF Mono",Menlo,"Cascadia Code",Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    --measure:44rem;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#080c14; --surface:#111927; --surface-2:#161f2e; --border:#25303f;
+      --ink:#e4eaf3; --ink-muted:#98a3b8; --ink-faint:#616d86;
+      --accent:#f2a83a; --accent-soft:#f4b658; --accent-ink:#150f04;
+      --pos:#33c2ab; --neg:#e5687f; --grid:#1c2534;
+      --code-bg:#0d1521;
+    }
+  }
+  :root[data-theme="light"]{
+    --bg:#e9edf3; --surface:#ffffff; --surface-2:#f3f6fb; --border:#d2dae6;
+    --ink:#182130; --ink-muted:#54607a; --ink-faint:#8894ab;
+    --accent:#a9670c; --accent-soft:#c77d16; --accent-ink:#ffffff;
+    --pos:#1c9182; --neg:#cf5570; --grid:#e0e6f0; --code-bg:#f3f6fb;
+  }
+  :root[data-theme="dark"]{
+    --bg:#080c14; --surface:#111927; --surface-2:#161f2e; --border:#25303f;
+    --ink:#e4eaf3; --ink-muted:#98a3b8; --ink-faint:#616d86;
+    --accent:#f2a83a; --accent-soft:#f4b658; --accent-ink:#150f04;
+    --pos:#33c2ab; --neg:#e5687f; --grid:#1c2534; --code-bg:#0d1521;
+  }
+
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  @media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{animation:none!important;transition:none!important}}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:var(--sans);line-height:1.7;-webkit-font-smoothing:antialiased;
+    font-size:17px;
+  }
+  .wrap{max-width:var(--measure);margin:0 auto;padding:0 22px}
+  .bleed{max-width:62rem;margin-left:auto;margin-right:auto;padding:0 22px}
+
+  /* scroll progress */
+  #progress{position:fixed;top:0;left:0;height:3px;width:0;background:var(--accent);z-index:50}
+
+  /* masthead */
+  header.mast{padding:72px 0 40px}
+  .eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.22em;text-transform:uppercase;color:var(--accent);margin:0 0 18px}
+  h1{font-size:clamp(2.1rem,6vw,3.4rem);line-height:1.05;letter-spacing:-.025em;font-weight:800;margin:0;text-wrap:balance}
+  .lede{font-size:1.2rem;color:var(--ink-muted);margin:22px 0 0;max-width:40rem}
+  .chips{display:flex;flex-wrap:wrap;gap:10px;margin-top:30px}
+  .chip{font-family:var(--mono);font-size:.78rem;background:var(--surface);border:1px solid var(--border);
+    border-radius:999px;padding:7px 13px;color:var(--ink-muted)}
+  .chip b{color:var(--ink);font-weight:600}
+
+  /* table of contents */
+  nav.toc{border-top:1px solid var(--border);border-bottom:1px solid var(--border);margin-top:44px;padding:22px 0}
+  nav.toc ol{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:1fr 1fr;gap:6px 32px}
+  @media(max-width:640px){nav.toc ol{grid-template-columns:1fr}}
+  nav.toc a{font-family:var(--mono);font-size:.86rem;color:var(--ink-muted);text-decoration:none;display:flex;gap:12px;padding:5px 0;align-items:baseline}
+  nav.toc a:hover{color:var(--ink)}
+  nav.toc a .n{color:var(--accent);font-size:.74rem}
+
+  section{padding:54px 0;border-top:1px solid var(--border)}
+  section:first-of-type{border-top:none}
+  .stage{font-family:var(--mono);font-size:.72rem;letter-spacing:.2em;text-transform:uppercase;color:var(--accent);margin:0 0 12px}
+  h2{font-size:clamp(1.5rem,3.6vw,2.1rem);line-height:1.12;letter-spacing:-.02em;font-weight:750;margin:0 0 8px;text-wrap:balance}
+  h3{font-size:1.12rem;font-weight:700;margin:34px 0 6px;letter-spacing:-.01em}
+  p{margin:14px 0}
+  .wrap p, .wrap li{max-width:var(--measure)}
+  a{color:var(--accent);text-underline-offset:3px;text-decoration-thickness:1px}
+  strong{color:var(--ink);font-weight:650}
+  em.term{font-style:normal;font-family:var(--mono);font-size:.9em;color:var(--ink);background:var(--code-bg);
+    padding:1px 6px;border-radius:5px;border:1px solid var(--border)}
+  ul{padding-left:1.1em}
+  li{margin:8px 0}
+  li::marker{color:var(--accent)}
+
+  .note{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);
+    border-radius:10px;padding:16px 18px;margin:26px 0;font-size:.96rem}
+  .note .h{font-family:var(--mono);font-size:.72rem;letter-spacing:.15em;text-transform:uppercase;color:var(--accent);margin:0 0 6px}
+
+  figure{margin:34px 0;background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+  figure .body{padding:22px}
+  figcaption{font-size:.87rem;color:var(--ink-muted);padding:14px 22px;border-top:1px solid var(--border);background:var(--surface-2)}
+  figcaption b{color:var(--ink);font-weight:600}
+  .fig-scroll{overflow-x:auto}
+
+  code{font-family:var(--mono);font-size:.88em;background:var(--code-bg);border:1px solid var(--border);padding:1px 5px;border-radius:5px}
+  pre{background:var(--code-bg);border:1px solid var(--border);border-radius:10px;padding:16px;overflow-x:auto;font-family:var(--mono);font-size:.82rem;line-height:1.6}
+  pre code{background:none;border:none;padding:0}
+
+  /* generic flow boxes */
+  .flow{display:flex;flex-direction:column;align-items:center;gap:0;font-family:var(--mono);font-size:.8rem}
+  .node{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:12px 16px;text-align:center;min-width:150px;max-width:100%}
+  .node .t{font-weight:700;color:var(--ink);font-family:var(--sans);font-size:.92rem}
+  .node .s{color:var(--ink-faint);font-size:.72rem;margin-top:2px}
+  .node.accent{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,var(--surface))}
+  .arrow{color:var(--ink-faint);font-size:1.1rem;line-height:1;padding:7px 0}
+  .split{display:flex;gap:16px;width:100%;justify-content:center;flex-wrap:wrap}
+  .col{display:flex;flex-direction:column;align-items:center;gap:0;flex:1;min-width:210px}
+  .branch-label{font-size:.68rem;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin-bottom:8px}
+
+  /* legend swatches */
+  .legend{display:flex;flex-wrap:wrap;gap:16px;font-family:var(--mono);font-size:.78rem;color:var(--ink-muted);margin:2px 0 0}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .sw{width:13px;height:13px;border-radius:3px;display:inline-block}
+
+  /* spectrogram controls */
+  .toggle{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;font-family:var(--mono);font-size:.8rem}
+  .toggle button{background:var(--surface-2);color:var(--ink-muted);border:none;padding:8px 14px;cursor:pointer;font:inherit}
+  .toggle button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink)}
+  .toggle button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+  canvas{display:block;width:100%;height:auto;border-radius:8px}
+
+  .axis-label{font-family:var(--mono);font-size:.72rem;fill:var(--ink-faint)}
+  .val-label{font-family:var(--mono);font-size:.72rem;fill:var(--ink)}
+  .tick{stroke:var(--grid);stroke-width:1}
+  .zero{stroke:var(--ink-faint);stroke-width:1.4}
+
+  .tooltip{position:fixed;pointer-events:none;background:var(--ink);color:var(--bg);font-family:var(--mono);
+    font-size:.74rem;padding:6px 9px;border-radius:6px;opacity:0;transition:opacity .1s;z-index:40;white-space:nowrap}
+
+  table.spec{width:100%;border-collapse:collapse;font-size:.87rem;margin-top:6px}
+  table.spec th,table.spec td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--border)}
+  table.spec th{font-family:var(--mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-faint);font-weight:600}
+  table.spec td:last-child,table.spec th:last-child{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+  table.spec td b{color:var(--ink)}
+
+  footer{border-top:1px solid var(--border);padding:40px 0 80px;color:var(--ink-faint);font-size:.9rem}
+  footer code{font-size:.85em}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+</style>
+
+<div id="progress"></div>
+<div class="tooltip" id="tt"></div>
+
+<header class="mast wrap">
+  <p class="eyebrow">Signal → Model → Signal</p>
+  <h1>How a realtime speech denoiser actually works</h1>
+  <p class="lede">A walk through the whole pipeline in your <code>Denoiser</code> project — from a noisy microphone
+  waveform, into the frequency domain, through DeepFilterNet's two-stage neural network, and back out to a clean
+  voice on your call. No prior DSP background assumed.</p>
+  <div class="chips">
+    <span class="chip"><b>DeepFilterNet3</b> · DfNet</span>
+    <span class="chip"><b>2.14M</b> parameters</span>
+    <span class="chip"><b>48 kHz</b> · 960-pt STFT</span>
+    <span class="chip"><b>~50 ms</b> latency</span>
+    <span class="chip"><b>+11 dB</b> measured</span>
+    <span class="chip">runs on <b>CPU</b> at 0.2× realtime</span>
+  </div>
+  <nav class="toc" aria-label="Contents">
+    <ol>
+      <li><a href="#s0"><span class="n">00</span> The problem: speech buried in noise</a></li>
+      <li><a href="#s1"><span class="n">01</span> Into the frequency domain (STFT)</a></li>
+      <li><a href="#s2"><span class="n">02</span> The classic fix — and its limit</a></li>
+      <li><a href="#s3"><span class="n">03</span> Idea one: ERB bands</a></li>
+      <li><a href="#s4"><span class="n">04</span> Idea two: deep filtering</a></li>
+      <li><a href="#s5"><span class="n">05</span> The full network: DfNet</a></li>
+      <li><a href="#s6"><span class="n">06</span> Memory, lookahead & latency</a></li>
+      <li><a href="#s7"><span class="n">07</span> Making it realtime: warm context</a></li>
+    </ol>
+  </nav>
+</header>
+
+<main>
+
+<!-- ============ 00 ============ -->
+<section id="s0"><div class="wrap">
+  <p class="stage">Stage 00 · The goal</p>
+  <h2>Speech buried in noise</h2>
+  <p>Your microphone captures one stream of numbers — air pressure sampled 48,000 times a second. That single stream
+  is really two things added together: the <strong>speech</strong> you want, and the <strong>noise</strong> you don't
+  (a fan, keyboard, traffic, café babble). Written simply:</p>
+  <p style="text-align:center;font-family:var(--mono);font-size:1.05rem;color:var(--ink)">
+    mic(t) &nbsp;=&nbsp; <span style="color:var(--accent)">speech(t)</span> &nbsp;+&nbsp; <span style="color:var(--neg)">noise(t)</span>
+  </p>
+  <p>The denoiser's whole job is to estimate <span style="color:var(--accent)">speech(t)</span> and throw away the rest.
+  The trouble is that in the raw waveform the two are hopelessly tangled — every sample is a sum, and you can't
+  un-add two numbers from their total. Look at the waveform below: the noisy and clean signals are almost
+  indistinguishable to the eye.</p>
+
+  <figure>
+    <div class="body">
+      <canvas id="wave" width="900" height="220" aria-label="Noisy versus clean speech waveform"></canvas>
+      <div class="legend" style="margin-top:14px">
+        <span><i class="sw" style="background:var(--neg)"></i> noisy mic input</span>
+        <span><i class="sw" style="background:var(--accent)"></i> clean speech (target)</span>
+      </div>
+    </div>
+    <figcaption>The same half-second of speech, with and without noise. In the <b>time domain</b> the noise smears
+    across everything and the two waveforms overlap almost completely — there is no obvious knob to turn. The trick is
+    to change coordinates.</figcaption>
+  </figure>
+</div></section>
+
+<!-- ============ 01 ============ -->
+<section id="s1"><div class="wrap">
+  <p class="stage">Stage 01 · Representation</p>
+  <h2>Into the frequency domain</h2>
+  <p>Speech and noise look tangled in time, but they separate beautifully in <strong>frequency</strong>. Voiced speech
+  is built from a fundamental pitch and a stack of evenly-spaced <em class="term">harmonics</em> — sharp horizontal
+  ridges of energy. Most noise is broadband — a diffuse haze spread across all frequencies. Once you can see that
+  difference, you can act on it.</p>
+  <p>To get there we use the <strong>Short-Time Fourier Transform (STFT)</strong>. Instead of transforming the whole
+  signal at once, we slide a short window along it and take a Fourier transform of each little slice:</p>
+  <ul>
+    <li>Cut the audio into overlapping frames — here a <strong>960-sample window</strong> (20&nbsp;ms) that hops
+      forward <strong>480 samples</strong> (10&nbsp;ms) each step, so frames overlap 50%.</li>
+    <li>Run an FFT on each frame → <strong>481 frequency bins</strong> (0&nbsp;Hz up to 24&nbsp;kHz, spaced 50&nbsp;Hz apart).</li>
+    <li>Each bin is a <em class="term">complex</em> number: a <strong>magnitude</strong> (how much of that frequency)
+      and a <strong>phase</strong> (its timing). Stack the magnitudes of every frame side by side and you get a
+      <strong>spectrogram</strong> — a picture of sound.</li>
+  </ul>
+
+  <figure>
+    <div class="body">
+      <div class="fig-scroll">
+      <svg viewBox="0 0 900 200" width="900" style="max-width:100%;height:auto" role="img" aria-label="Sliding STFT window over a waveform producing one spectrogram column">
+        <!-- waveform -->
+        <g id="stftwave"></g>
+        <!-- window -->
+        <rect x="120" y="18" width="150" height="150" rx="6" fill="color-mix(in srgb,var(--accent) 14%,transparent)" stroke="var(--accent)" stroke-dasharray="4 3"/>
+        <text x="195" y="12" text-anchor="middle" class="axis-label" style="fill:var(--accent)">20 ms window</text>
+        <text x="195" y="186" text-anchor="middle" class="axis-label">hop 10 ms →</text>
+        <!-- arrow -->
+        <path d="M285 93 L340 93" stroke="var(--ink-faint)" stroke-width="1.5" marker-end="url(#ah)"/>
+        <text x="312" y="82" text-anchor="middle" class="axis-label">FFT</text>
+        <!-- one column result -->
+        <g id="stftcol"></g>
+        <text x="420" y="186" text-anchor="middle" class="axis-label">1 column = 481 bins</text>
+        <defs><marker id="ah" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0 0 L6 3 L0 6 z" fill="var(--ink-faint)"/></marker></defs>
+      </svg>
+      </div>
+    </div>
+    <figcaption>Each windowed slice becomes one vertical column of the spectrogram. Repeat down the whole signal and
+    the columns tile into an image — the representation everything downstream operates on.</figcaption>
+  </figure>
+
+  <p>Here is a real spectrogram, computed live in your browser from a synthetic voice + noise. Toggle between the
+  noisy input and the clean target. Notice how the <span style="color:var(--accent)">harmonic ridges</span> of speech
+  stay put while the noise is the speckled floor <em>between and around</em> them — <strong>that</strong> is the
+  structure the model exploits.</p>
+
+  <figure>
+    <div class="body">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px">
+        <div class="toggle" role="group" aria-label="Spectrogram view">
+          <button id="btn-noisy" aria-pressed="true">noisy input</button>
+          <button id="btn-clean" aria-pressed="false">clean target</button>
+        </div>
+        <div class="legend"><span>low freq</span>
+          <i class="sw" style="width:120px;height:11px;border-radius:3px;background:linear-gradient(90deg,#000004,#3b0f70,#8c2981,#de4968,#fe9f6d,#fcfdbf)"></i>
+          <span>high energy →</span></div>
+      </div>
+      <canvas id="spec" width="900" height="260" aria-label="Live spectrogram of noisy versus clean speech"></canvas>
+      <div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:.7rem;color:var(--ink-faint);margin-top:6px">
+        <span>↑ frequency (0–8 kHz)</span><span>time →</span>
+      </div>
+    </div>
+    <figcaption>The <b>magma</b> colormap (dark = quiet, bright = loud) is the long-standing convention for
+    spectrograms. Denoising is, visually, the act of erasing the haze between the bright ridges without touching the
+    ridges themselves.</figcaption>
+  </figure>
+</div></section>
+
+<!-- ============ 02 ============ -->
+<section id="s2"><div class="wrap">
+  <p class="stage">Stage 02 · The classic approach</p>
+  <h2>The classic fix — and why it's not enough</h2>
+  <p>If speech is the bright ridges and noise is the floor, the obvious move is to build a <strong>mask</strong>: for
+  every time-frequency bin, decide how much to keep. Multiply each bin's magnitude by a gain between 0 (silence this
+  bin) and 1 (keep it). Bins dominated by speech → gain near 1; bins that are mostly noise → gain near 0. This is the
+  idea behind spectral subtraction, Wiener filtering, and the classic <code>RNNoise</code>.</p>
+  <p style="text-align:center;font-family:var(--mono);font-size:1.02rem">
+    Ŝ(t,f) &nbsp;=&nbsp; <span style="color:var(--accent)">g(t,f)</span> · X(t,f) &nbsp;&nbsp;&nbsp;<span style="color:var(--ink-faint)">, 0 ≤ g ≤ 1</span>
+  </p>
+  <p>It works, up to a point. But a single real-valued gain per bin has two hard limits:</p>
+  <ul>
+    <li><strong>It can't fix phase.</strong> A gain only scales magnitude. But when noise corrupts a bin it also
+      corrupts the <em>timing</em> (phase) of that frequency. Keep the noisy phase and you cap how clean the result
+      can sound.</li>
+    <li><strong>It can't rebuild structure.</strong> When speech and noise share a bin, the gain must compromise —
+      turn it down and you dull the voice, turn it up and you keep noise. Aggressive masking produces
+      <em class="term">musical noise</em>: warbly, watery artifacts. It has no way to <em>reconstruct</em> what the
+      speech should have been in that bin.</li>
+  </ul>
+  <div class="note">
+    <p class="h">The key limitation</p>
+    <p style="margin:0">A per-bin mask treats every bin in isolation. But speech is highly <strong>correlated across
+    neighbouring time frames</strong> — a harmonic ridge is smooth and predictable from one 10&nbsp;ms frame to the
+    next. A mask throws that information away. DeepFilterNet's headline idea is to <em>use</em> it.</p>
+  </div>
+</div></section>
+
+<!-- ============ 03 ============ -->
+<section id="s3"><div class="wrap">
+  <p class="stage">Stage 03 · DeepFilterNet, idea one</p>
+  <h2>ERB bands — predict 32 numbers, not 481</h2>
+  <p>Predicting a separate gain for all 481 frequency bins every 10&nbsp;ms is expensive and wasteful — your ear
+  doesn't resolve high frequencies that finely anyway. Human hearing groups frequencies into <strong>critical
+  bands</strong> that get wider as pitch rises. DeepFilterNet mirrors this with the <strong>ERB scale</strong>
+  (Equivalent Rectangular Bandwidth): it collapses the 481 bins into just <strong>32 ERB bands</strong> — narrow and
+  detailed in the low frequencies where the voice lives, broad and coarse up high.</p>
+
+  <figure>
+    <div class="body">
+      <div class="fig-scroll">
+      <svg viewBox="0 0 900 210" width="900" style="max-width:100%;height:auto" role="img" aria-label="481 linear frequency bins mapped into 32 widening ERB bands">
+        <text x="10" y="20" class="axis-label">481 linear FFT bins (50 Hz each)</text>
+        <g id="linbins"></g>
+        <text x="10" y="130" class="axis-label">32 ERB bands — widen with frequency</text>
+        <g id="erbbands"></g>
+        <text x="450" y="205" text-anchor="middle" class="axis-label">0 Hz &nbsp;———————————&nbsp;  frequency  &nbsp;———————————&nbsp;  24 kHz</text>
+      </svg>
+      </div>
+    </div>
+    <figcaption>The full spectrum (top) is compressed into 32 perceptual bands (bottom). The model predicts one gain
+    per band — <b>32 numbers</b> instead of 481 — then those gains are stretched back across the fine bins. Fewer
+    outputs means a tiny, fast network.</figcaption>
+  </figure>
+
+  <p>This ERB gain stage is <strong>Stage 1</strong> of the network. It captures the coarse <em>spectral
+  envelope</em> — the overall shape of "where is the voice right now" — and does the bulk of the noise suppression
+  across the entire 0–24&nbsp;kHz range, cheaply. It behaves like a smart, perceptually-weighted version of the
+  classic mask.</p>
+</div></section>
+
+<!-- ============ 04 ============ -->
+<section id="s4"><div class="wrap">
+  <p class="stage">Stage 04 · DeepFilterNet, idea two</p>
+  <h2>Deep filtering — a tiny filter across time</h2>
+  <p>The ERB gains clean up the broad picture, but they're too coarse for the perceptually critical low band (roughly
+  <strong>0–5 kHz</strong>, the first <strong>96 bins</strong>) where the voice's harmonics and intelligibility live.
+  For that band DeepFilterNet does something cleverer than a gain. This is the operation the whole method is named
+  after: <strong>deep filtering</strong>.</p>
+  <p>Instead of multiplying a bin by one number, it applies a small <strong>complex filter of order 5</strong> — five
+  learned complex coefficients that combine the bin with its neighbours <em>across recent time frames</em>:</p>
+  <p style="text-align:center;font-family:var(--mono);font-size:.98rem;line-height:2">
+    Ŝ(t,f) &nbsp;=&nbsp; Σ<sub style="font-size:.7em">i=0…4</sub> &nbsp;<span style="color:var(--accent)">c<sub>i</sub>(t,f)</span> · X(t−i+ℓ, f)
+  </p>
+
+  <figure>
+    <div class="body">
+      <div class="fig-scroll">
+      <svg viewBox="0 0 900 260" width="900" style="max-width:100%;height:auto" role="img" aria-label="Deep filtering combines five consecutive time frames at one frequency with complex coefficients">
+        <g id="dfgrid"></g>
+      </svg>
+      </div>
+    </div>
+    <figcaption>To produce one output bin (the amber cell), deep filtering takes a weighted <b>complex</b> combination
+    of the <b>same frequency across 5 consecutive frames</b> — 3 past, the current one, and 2 of lookahead. Because
+    the coefficients are complex, this adjusts <b>both magnitude and phase</b>, and because it spans time it can
+    exploit the frame-to-frame correlation a per-bin mask ignores.</figcaption>
+  </figure>
+
+  <p>Why this is powerful:</p>
+  <ul>
+    <li><strong>It corrects phase</strong> — complex coefficients rotate as well as scale, so the reconstructed
+      speech isn't stuck with the noisy timing.</li>
+    <li><strong>It reconstructs, not just attenuates.</strong> By blending several frames it can fill in a harmonic
+      that noise partially masked, using the predictable structure of the surrounding frames — like interpolating a
+      briefly-obscured line from its trajectory.</li>
+    <li><strong>It suppresses noise between harmonics</strong> far more precisely than a coarse gain, which is what
+      kills the "musical noise" artifact.</li>
+  </ul>
+  <div class="note">
+    <p class="h">Two stages, two jobs</p>
+    <p style="margin:0"><strong>ERB gains</strong> = coarse, full-band envelope cleanup (cheap, perceptual).
+    <strong>Deep filtering</strong> = fine, phase-aware reconstruction of the low speech band (precise). The network
+    runs both and combines them.</p>
+  </div>
+</div></section>
+
+<!-- ============ 05 ============ -->
+<section id="s5"><div class="bleed">
+  <p class="stage">Stage 05 · The architecture</p>
+  <h2>The full network: DfNet</h2>
+</div>
+<div class="wrap">
+  <p>Now we can assemble the whole thing. DeepFilterNet3's model — class <code>DfNet</code>, about
+  <strong>2.14 million parameters</strong> — is a compact convolutional-recurrent network with a shared encoder that
+  splits into two decoders, one per stage. Here is the actual signal flow, top to bottom:</p>
+</div>
+<div class="bleed">
+  <figure>
+    <div class="body">
+      <div class="flow">
+        <div class="node"><div class="t">STFT analysis</div><div class="s">waveform → complex spectrum · 481 bins/frame</div></div>
+        <div class="arrow">▼</div>
+        <div class="split">
+          <div class="col">
+            <div class="branch-label">feature A</div>
+            <div class="node"><div class="t">ERB features</div><div class="s">log-power in 32 bands, normalized</div></div>
+          </div>
+          <div class="col">
+            <div class="branch-label">feature B</div>
+            <div class="node"><div class="t">Spectrum features</div><div class="s">complex, first 96 bins, unit-norm</div></div>
+          </div>
+        </div>
+        <div class="arrow">▼</div>
+        <div class="node accent" style="min-width:280px">
+          <div class="t">Encoder</div>
+          <div class="s">conv stacks on both features → combined embedding · <b>484k params</b></div>
+        </div>
+        <div class="arrow">▼</div>
+        <div class="node accent" style="min-width:280px">
+          <div class="t">GRU — temporal memory</div>
+          <div class="s">carries context across frames · also predicts local SNR</div>
+        </div>
+        <div class="arrow">▼</div>
+        <div class="split">
+          <div class="col">
+            <div class="branch-label">Stage 1 · coarse</div>
+            <div class="node"><div class="t">ERB decoder</div><div class="s">GRU + U-Net w/ skips · 820k</div></div>
+            <div class="arrow">▼</div>
+            <div class="node"><div class="t">Mask</div><div class="s">32 gains → 481 bins, ×spectrum</div></div>
+          </div>
+          <div class="col">
+            <div class="branch-label">Stage 2 · fine</div>
+            <div class="node"><div class="t">DF decoder</div><div class="s">GRU → 96×5 complex coeffs · 831k</div></div>
+            <div class="arrow">▼</div>
+            <div class="node"><div class="t">Deep filtering</div><div class="s">5-tap complex filter, low 96 bins</div></div>
+          </div>
+        </div>
+        <div class="arrow">▼</div>
+        <div class="node"><div class="t">Recombine + ISTFT</div><div class="s">masked highs + deep-filtered lows → clean waveform</div></div>
+      </div>
+    </div>
+    <figcaption>The <b>encoder</b> reads both feature streams and fuses them; the <b>GRU</b> gives the model memory of
+    what came before (crucial — see next stage); then two decoders run the two stages in parallel. Stage 1's mask
+    handles the whole band coarsely, Stage 2's deep filter refines the low speech band. Their outputs are recombined
+    and inverse-transformed back to sound.</figcaption>
+  </figure>
+</div>
+<div class="wrap">
+  <h3>Parameter budget</h3>
+  <p>Where the 2.14M weights actually go — note how the two decoders dominate, and that the entire model is small
+  enough to run comfortably on a laptop CPU:</p>
+  <table class="spec">
+    <thead><tr><th>Component</th><th>Role</th><th>Params</th></tr></thead>
+    <tbody>
+      <tr><td><b>Encoder</b></td><td>fuse ERB + spectrum features → embedding</td><td>483,969</td></tr>
+      <tr><td><b>ERB decoder</b></td><td>Stage 1 — predict 32 band gains (U-Net)</td><td>820,098</td></tr>
+      <tr><td><b>DF decoder</b></td><td>Stage 2 — predict 96×5 complex coefficients</td><td>831,417</td></tr>
+      <tr><td>Mask / DF op / transforms</td><td>apply gains & filter (no learned weights)</td><td>0</td></tr>
+      <tr><td style="color:var(--ink);font-weight:700">Total</td><td style="color:var(--ink-faint)">DfNet</td><td><b>2,135,484</b></td></tr>
+    </tbody>
+  </table>
+</div></section>
+
+<!-- ============ 06 ============ -->
+<section id="s6"><div class="wrap">
+  <p class="stage">Stage 06 · Time and latency</p>
+  <h2>Memory, lookahead, and the latency budget</h2>
+  <p>Two design choices make this a <em>temporal</em> model rather than a frame-by-frame one, and both matter enormously
+  for realtime use.</p>
+  <h3>The GRU gives it memory</h3>
+  <p>A <em class="term">GRU</em> (gated recurrent unit) is a small recurrent network that maintains a hidden state
+  summarising everything it has seen so far. This is how the model knows the difference between a steady fan (present
+  for seconds — clearly noise) and a spoken vowel (structured, evolving — clearly speech). Denoising the current 10&nbsp;ms
+  frame well requires knowing the recent past. <strong>Hold this thought — it's the entire reason realtime streaming
+  is tricky (next section).</strong></p>
+  <h3>Lookahead costs latency</h3>
+  <p>The deep filter also peeks <strong>2 frames into the future</strong> (the <code>+ℓ</code> lookahead term from
+  Stage 04). Seeing a little ahead makes reconstruction more accurate, but you can't process a frame until those
+  future frames have arrived — so it imposes an unavoidable <strong>algorithmic delay of 2 frames = 20&nbsp;ms</strong>.
+  On top of that sits the audio buffering of the realtime pipeline. Here's the full budget for your project:</p>
+
+  <figure>
+    <div class="body">
+      <div class="fig-scroll">
+      <svg viewBox="0 0 900 150" width="900" style="max-width:100%;height:auto" role="img" aria-label="Latency budget: 20ms model lookahead plus 40ms block plus buffering, about 50ms total">
+        <g id="latency"></g>
+      </svg>
+      </div>
+    </div>
+    <figcaption>Total added mouth-to-ear latency lands around <b>~50 ms</b> — well under the ~150 ms where a call
+    starts to feel laggy. The model's own math (<b>20 ms</b>) is fixed; the rest is the block size you choose, which
+    trades latency against smoothness.</figcaption>
+  </figure>
+</div></section>
+
+<!-- ============ 07 ============ -->
+<section id="s7"><div class="wrap">
+  <p class="stage">Stage 07 · The realtime trick</p>
+  <h2>Making it realtime: warm context</h2>
+  <p>Here's the catch that the GRU's memory creates. DeepFilterNet3's model, as shipped, does <strong>not carry its
+  recurrent state between separate calls</strong> — every time you hand it a chunk of audio, its memory starts from
+  zero. For offline files that's fine: you pass the whole recording in one call and the GRU runs across all of it.</p>
+  <p>But a live call must be processed in tiny chunks as audio trickles in. If you denoise each small chunk
+  independently, the GRU is <em>cold</em> every time — it never accumulates the context it needs. I measured exactly
+  how bad this is on your machine. Small blocks don't just underperform; at 20–30&nbsp;ms they make the audio
+  <strong>worse than doing nothing</strong>:</p>
+
+  <figure>
+    <div class="body">
+      <div style="font-family:var(--mono);font-size:.78rem;color:var(--ink-muted);margin-bottom:6px">SNR improvement vs block size — processed independently</div>
+      <div class="fig-scroll"><svg id="chartA" viewBox="0 0 900 300" width="900" style="max-width:100%;height:auto" role="img" aria-label="Bar chart: SNR gain by block size, negative for small blocks"></svg></div>
+      <div class="legend" style="margin-top:10px">
+        <span><i class="sw" style="background:var(--neg)"></i> made it worse</span>
+        <span><i class="sw" style="background:var(--accent)"></i> improved</span>
+        <span style="color:var(--ink-faint)">dashed = whole-file ceiling (+11.6 dB)</span>
+      </div>
+    </div>
+    <figcaption>Independent-block processing only becomes good around 250–500&nbsp;ms — but that much added latency
+    makes a call feel like a walkie-talkie. Low latency and quality look mutually exclusive. They aren't.</figcaption>
+  </figure>
+
+  <p>The fix — the strategy your <code>DeepFilterNetBackend</code> actually uses — is <strong>warm left-context</strong>.
+  For every small output block, we don't feed the model just that block. We prepend a few hundred milliseconds of the
+  <em>recent past audio</em> and run the model over the whole window, but <strong>keep only the newest block's
+  output</strong>. The GRU warms up over the context every single time, so the block we emit is denoised with full
+  memory — yet we only ever output fresh audio.</p>
+
+  <figure>
+    <div class="body">
+      <div class="fig-scroll">
+      <svg viewBox="0 0 900 190" width="900" style="max-width:100%;height:auto" role="img" aria-label="A window of past context plus a new hop; only the new hop's output is kept">
+        <g id="warmdiag"></g>
+      </svg>
+      </div>
+    </div>
+    <figcaption>The context is audio we already have, so it adds <b>zero latency</b> — it only costs a little extra CPU
+    to reprocess it each step (cheap: the model runs at 0.2× realtime). Latency stays at one block; quality comes back.</figcaption>
+  </figure>
+
+  <p>And it works. Re-running with warm context at a 40&nbsp;ms hop recovers essentially all the quality of whole-file
+  processing — the sweet spot your backend ships with is <strong>40&nbsp;ms hop + 200&nbsp;ms context</strong>:</p>
+
+  <figure>
+    <div class="body">
+      <div style="font-family:var(--mono);font-size:.78rem;color:var(--ink-muted);margin-bottom:6px">SNR improvement at 40 ms hop — vs amount of warm context</div>
+      <div class="fig-scroll"><svg id="chartB" viewBox="0 0 900 300" width="900" style="max-width:100%;height:auto" role="img" aria-label="Bar chart: SNR gain rising with warm context to about 11 dB"></svg></div>
+      <div class="legend" style="margin-top:10px">
+        <span><i class="sw" style="background:var(--accent)"></i> SNR gain (dB)</span>
+        <span style="color:var(--ink-faint)">dashed = whole-file ceiling (+11.6 dB)</span>
+      </div>
+    </div>
+    <figcaption>With just 100–200&nbsp;ms of context, the streamed output reaches <b>+11.0 dB</b> — within a hair of
+    the <b>+11.6 dB</b> offline ceiling — at ~50&nbsp;ms latency and 0.2× realtime CPU. That is the whole game:
+    full-quality denoising, fast enough for a live call.</figcaption>
+  </figure>
+
+  <div class="note">
+    <p class="h">The pipeline, end to end</p>
+    <p style="margin:0"><code>mic → capture → warm-context denoise → virtual audio device → your call</code>. Two audio
+    streams (mic in, virtual device out) are decoupled by a worker thread and a ring buffer so the neural inference
+    never blocks the audio callbacks. The call app just sees "BlackHole" as its microphone and hears a clean voice.</p>
+  </div>
+</div></section>
+
+</main>
+
+<footer><div class="wrap">
+  <p>Built from your <code>Denoiser</code> project · model: DeepFilterNet3 (<code>DfNet</code>, 2,135,484 params) ·
+  measurements taken on this machine (M-series MacBook Air, CPU). Spectrogram and charts render live from synthetic
+  and measured data. Deep-filtering and ERB concepts follow Schröter et&nbsp;al., <em>DeepFilterNet</em>.</p>
+</div></footer>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const NS = "http://www.w3.org/2000/svg";
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+/* ---------- scroll progress ---------- */
+const prog = $("#progress");
+addEventListener("scroll", () => {
+  const h = document.documentElement.scrollHeight - innerHeight;
+  prog.style.width = (h > 0 ? (scrollY / h * 100) : 0) + "%";
+}, {passive:true});
+
+/* ---------- tooltip ---------- */
+const tt = $("#tt");
+function showTip(x, y, html){ tt.innerHTML = html; tt.style.left = (x+12)+"px"; tt.style.top = (y+12)+"px"; tt.style.opacity = 1; }
+function hideTip(){ tt.style.opacity = 0; }
+
+/* ---------- tiny FFT (iterative radix-2) ---------- */
+function fft(re, im){
+  const n = re.length;
+  for(let i=1,j=0;i<n;i++){
+    let bit=n>>1;
+    for(;j&bit;bit>>=1) j^=bit;
+    j^=bit;
+    if(i<j){ [re[i],re[j]]=[re[j],re[i]]; [im[i],im[j]]=[im[j],im[i]]; }
+  }
+  for(let len=2;len<=n;len<<=1){
+    const ang=-2*Math.PI/len, wr=Math.cos(ang), wi=Math.sin(ang);
+    for(let i=0;i<n;i+=len){
+      let cr=1, ci=0;
+      for(let k=0;k<len>>1;k++){
+        const a=i+k, b=a+(len>>1);
+        const xr=re[b]*cr-im[b]*ci, xi=re[b]*ci+im[b]*cr;
+        re[b]=re[a]-xr; im[b]=im[a]-xi; re[a]+=xr; im[a]+=xi;
+        const ncr=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=ncr;
+      }
+    }
+  }
+}
+
+/* ---------- magma colormap ---------- */
+const MAGMA = [[0,0,4],[28,16,68],[79,18,123],[129,37,129],[181,54,122],[222,80,104],[251,135,97],[254,194,135],[252,253,191]];
+function magma(t){
+  t = Math.max(0, Math.min(1, t));
+  const x = t*(MAGMA.length-1), i = Math.floor(x), f = x-i;
+  const a = MAGMA[i], b = MAGMA[Math.min(i+1,MAGMA.length-1)];
+  return [a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f];
+}
+
+/* ---------- synthesize a voice-like signal + noise, build spectrograms ---------- */
+const SR = 16000, NF = 256, HOP = 128, DUR = SR*2;
+function synth(){
+  const clean = new Float32Array(DUR), noisy = new Float32Array(DUR);
+  // three voiced "words" with gaps
+  const words = [[0.10,0.45,130],[0.60,1.00,155],[1.20,1.75,115]];
+  for(let i=0;i<DUR;i++){
+    const t = i/SR;
+    let s = 0;
+    for(const [t0,t1,f0] of words){
+      if(t>=t0 && t<=t1){
+        const env = Math.sin(Math.PI*(t-t0)/(t1-t0)); // fade in/out
+        const vib = 1 + 0.006*Math.sin(2*Math.PI*5*t);
+        for(let h=1; h*f0<7500; h++){
+          const amp = Math.exp(-h*0.28) * (1 + 0.6*Math.exp(-Math.pow((h*f0-900)/700,2))); // formant bump
+          s += amp*Math.sin(2*Math.PI*h*f0*vib*t);
+        }
+        s *= env*0.5;
+      }
+    }
+    clean[i] = s;
+  }
+  // deterministic pseudo-noise
+  let seed = 12345; const rnd = () => { seed=(seed*1103515245+12345)&0x7fffffff; return seed/0x7fffffff*2-1; };
+  for(let i=0;i<DUR;i++) noisy[i] = clean[i] + rnd()*0.22;
+  return {clean, noisy};
+}
+function spectrogram(sig){
+  const cols = Math.floor((sig.length-NF)/HOP);
+  const bins = NF/2;
+  const data = new Float32Array(cols*bins);
+  const re = new Float64Array(NF), im = new Float64Array(NF);
+  let mx = -1e9;
+  for(let c=0;c<cols;c++){
+    for(let k=0;k<NF;k++){
+      const w = 0.5-0.5*Math.cos(2*Math.PI*k/(NF-1)); // hann
+      re[k] = sig[c*HOP+k]*w; im[k] = 0;
+    }
+    fft(re, im);
+    for(let b=0;b<bins;b++){
+      const mag = Math.sqrt(re[b]*re[b]+im[b]*im[b])+1e-9;
+      const db = 20*Math.log10(mag);
+      data[c*bins+b] = db; if(db>mx) mx=db;
+    }
+  }
+  return {data, cols, bins, mx};
+}
+const SIG = synth();
+const SPEC = { noisy: spectrogram(SIG.noisy), clean: spectrogram(SIG.clean) };
+const gmax = Math.max(SPEC.noisy.mx, SPEC.clean.mx);
+
+function drawSpec(which){
+  const cv = $("#spec"), ctx = cv.getContext("2d");
+  const S = SPEC[which], floor = -55;
+  const img = ctx.createImageData(S.cols, S.bins);
+  for(let c=0;c<S.cols;c++){
+    for(let b=0;b<S.bins;b++){
+      const db = S.data[c*S.bins+b];
+      const t = Math.max(0, Math.min(1, (db-(gmax+floor))/(-floor)));
+      const [r,g,bl] = magma(t);
+      const px = ((S.bins-1-b)*S.cols + c)*4; // flip freq
+      img.data[px]=r; img.data[px+1]=g; img.data[px+2]=bl; img.data[px+3]=255;
+    }
+  }
+  // draw scaled via offscreen
+  const off = document.createElement("canvas"); off.width=S.cols; off.height=S.bins;
+  off.getContext("2d").putImageData(img,0,0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.drawImage(off, 0,0, cv.width, cv.height);
+}
+let specView = "noisy";
+function setSpec(v){
+  specView = v;
+  $("#btn-noisy").setAttribute("aria-pressed", v==="noisy");
+  $("#btn-clean").setAttribute("aria-pressed", v==="clean");
+  drawSpec(v);
+}
+$("#btn-noisy").onclick = () => setSpec("noisy");
+$("#btn-clean").onclick = () => setSpec("clean");
+
+/* ---------- hero waveform (noisy vs clean overlay) ---------- */
+function drawWave(){
+  const cv = $("#wave"), ctx = cv.getContext("2d"), W=cv.width, H=cv.height;
+  ctx.clearRect(0,0,W,H);
+  const N = 4000, mid=H/2;
+  const line = (sig, color, amp) => {
+    ctx.beginPath(); ctx.lineWidth=1.4; ctx.strokeStyle=color;
+    for(let x=0;x<W;x++){ const i=Math.floor(x/W*N); const y=mid - sig[i]*amp; x?ctx.lineTo(x,y):ctx.moveTo(x,y); }
+    ctx.stroke();
+  };
+  ctx.globalAlpha=0.55; line(SIG.noisy, css("--neg"), 150);
+  ctx.globalAlpha=1;    line(SIG.clean, css("--accent"), 150);
+  ctx.globalAlpha=1;
+}
+
+/* ---------- STFT concept svg ---------- */
+function buildSTFT(){
+  const wave = $("#stftwave"); let d="M20 93";
+  let seed=7; const rnd=()=>{seed=(seed*16807)%2147483647; return seed/2147483647*2-1;};
+  for(let x=20;x<=540;x+=3){ const v=Math.sin(x*0.13)*Math.exp(-Math.pow((x-180)/120,2))*38 + rnd()*10; d+=` L${x} ${93-v}`; }
+  const p=document.createElementNS(NS,"path"); p.setAttribute("d",d); p.setAttribute("fill","none");
+  p.setAttribute("stroke",css("--ink-muted")); p.setAttribute("stroke-width","1.2"); wave.appendChild(p);
+  // spectrogram column
+  const col=$("#stftcol");
+  for(let b=0;b<24;b++){
+    const e = Math.exp(-Math.pow((b-6)/4,2)) + Math.exp(-Math.pow((b-13)/5,2))*0.5 + Math.random()*0.08;
+    const [r,g,bl]=magma(Math.min(1,e));
+    const rect=document.createElementNS(NS,"rect");
+    rect.setAttribute("x",395); rect.setAttribute("y",18+b*6.1); rect.setAttribute("width",50); rect.setAttribute("height",6);
+    rect.setAttribute("fill",`rgb(${r|0},${g|0},${bl|0})`); col.appendChild(rect);
+  }
+  const bx=document.createElementNS(NS,"rect");
+  bx.setAttribute("x",395); bx.setAttribute("y",18); bx.setAttribute("width",50); bx.setAttribute("height",146);
+  bx.setAttribute("fill","none"); bx.setAttribute("stroke",css("--border")); col.appendChild(bx);
+}
+
+/* ---------- ERB bands svg ---------- */
+function buildERB(){
+  const lin=$("#linbins"), erb=$("#erbbands");
+  for(let i=0;i<60;i++){
+    const r=document.createElementNS(NS,"rect");
+    r.setAttribute("x",12+i*14.6); r.setAttribute("y",30); r.setAttribute("width",12); r.setAttribute("height",26);
+    r.setAttribute("rx",2); r.setAttribute("fill","var(--surface-2)"); r.setAttribute("stroke","var(--border)");
+    lin.appendChild(r);
+  }
+  // 32 ERB-ish widening bands (approx: width grows)
+  let x=12; const total=876;
+  const widths=[]; let acc=0;
+  for(let i=0;i<32;i++){ const w=Math.pow(1.10,i); widths.push(w); acc+=w; }
+  for(let i=0;i<32;i++){
+    const w = widths[i]/acc*total - 2;
+    const r=document.createElementNS(NS,"rect");
+    r.setAttribute("x",x); r.setAttribute("y",140); r.setAttribute("width",Math.max(3,w)); r.setAttribute("height",30);
+    r.setAttribute("rx",2);
+    r.setAttribute("fill", i%2? "color-mix(in srgb,var(--accent) 22%,var(--surface))":"color-mix(in srgb,var(--accent) 40%,var(--surface))");
+    r.setAttribute("stroke","var(--accent)"); r.setAttribute("stroke-opacity",".5");
+    erb.appendChild(r); x+=w+2;
+  }
+}
+
+/* ---------- deep filtering grid svg ---------- */
+function buildDF(){
+  const g=$("#dfgrid");
+  const cols=8, rows=5, cw=70, ch=34, ox=150, oy=40;
+  const frameColored=[2,3,4,5,6]; // the 5 taps feeding output at col 6
+  for(let c=0;c<cols;c++){
+    for(let r=0;r<rows;r++){
+      const rect=document.createElementNS(NS,"rect");
+      rect.setAttribute("x",ox+c*cw); rect.setAttribute("y",oy+r*ch); rect.setAttribute("width",cw-4); rect.setAttribute("height",ch-4);
+      rect.setAttribute("rx",4);
+      const isTap = frameColored.includes(c) && r===2;
+      rect.setAttribute("fill", isTap? "color-mix(in srgb,var(--accent) 30%,var(--surface))":"var(--surface-2)");
+      rect.setAttribute("stroke", isTap? "var(--accent)":"var(--border)");
+      g.appendChild(rect);
+    }
+  }
+  // output cell highlighted (col6,row2) already amber-ish; mark with ring
+  const out=document.createElementNS(NS,"rect");
+  out.setAttribute("x",ox+6*cw); out.setAttribute("y",oy+2*ch); out.setAttribute("width",cw-4); out.setAttribute("height",ch-4);
+  out.setAttribute("rx",4); out.setAttribute("fill","var(--accent)"); out.setAttribute("stroke","var(--accent)"); g.appendChild(out);
+  // labels
+  const lab=(x,y,txt,cls)=>{const t=document.createElementNS(NS,"text");t.setAttribute("x",x);t.setAttribute("y",y);t.setAttribute("class",cls||"axis-label");t.textContent=txt;g.appendChild(t);};
+  lab(ox-8, oy-14, "time frames →");
+  lab(20, oy+2*ch+22, "one frequency", "val-label");
+  lab(ox+3.5*cw, oy+rows*ch+28, "5 taps: 3 past · now · 2 lookahead", "axis-label");
+  // vertical freq arrow
+  const ar=document.createElementNS(NS,"text"); ar.setAttribute("x",22); ar.setAttribute("y",oy+70); ar.setAttribute("class","axis-label"); ar.textContent="freq"; g.appendChild(ar);
+  // brace-ish lines from taps to output
+  frameColored.forEach(c=>{
+    const l=document.createElementNS(NS,"line");
+    l.setAttribute("x1",ox+c*cw+cw/2-2); l.setAttribute("y1",oy+2*ch+ch-4);
+    l.setAttribute("x2",ox+6*cw+cw/2-2); l.setAttribute("y2",oy+2*ch+ch+30);
+    l.setAttribute("stroke","var(--accent)"); l.setAttribute("stroke-width","1"); l.setAttribute("stroke-opacity",".35"); g.appendChild(l);
+  });
+  lab(ox+6*cw+cw/2-40, oy+2*ch+ch+46, "Σ complex weights → output", "val-label");
+}
+
+/* ---------- latency budget svg ---------- */
+function buildLatency(){
+  const g=$("#latency");
+  const segs=[["model lookahead",20,"var(--accent)"],["block (40 ms hop)",40,"var(--pos)"],["buffering",15,"var(--ink-faint)"]];
+  const total=75, x0=20, W=760, scale=W/90;
+  let x=x0;
+  segs.forEach(([name,ms,col])=>{
+    const w=ms*scale;
+    const r=document.createElementNS(NS,"rect");
+    r.setAttribute("x",x); r.setAttribute("y",50); r.setAttribute("width",w-2); r.setAttribute("height",40); r.setAttribute("rx",5);
+    r.setAttribute("fill",col); r.setAttribute("fill-opacity",".85"); g.appendChild(r);
+    const t=document.createElementNS(NS,"text"); t.setAttribute("x",x+w/2); t.setAttribute("y",75); t.setAttribute("text-anchor","middle");
+    t.setAttribute("class","val-label"); t.style.fill="#fff"; t.textContent=ms+" ms"; g.appendChild(t);
+    const lb=document.createElementNS(NS,"text"); lb.setAttribute("x",x+w/2); lb.setAttribute("y",42); lb.setAttribute("text-anchor","middle");
+    lb.setAttribute("class","axis-label"); lb.textContent=name; g.appendChild(lb);
+    x+=w;
+  });
+  const tot=document.createElementNS(NS,"text"); tot.setAttribute("x",x+14); tot.setAttribute("y",75); tot.setAttribute("class","val-label"); tot.style.fill="var(--accent)"; tot.textContent="≈ 50–75 ms total"; g.appendChild(tot);
+  const scaleLine=document.createElementNS(NS,"text"); scaleLine.setAttribute("x",x0); scaleLine.setAttribute("y",120); scaleLine.setAttribute("class","axis-label"); scaleLine.textContent="↑ humans notice lag around ~150 ms — this stays well under."; g.appendChild(scaleLine);
+}
+
+/* ---------- warm context diagram ---------- */
+function buildWarm(){
+  const g=$("#warmdiag");
+  const ctxW=560, hopW=140, x0=40, y=50, h=50;
+  const mk=(x,w,fill,stroke,label,sub)=>{
+    const r=document.createElementNS(NS,"rect"); r.setAttribute("x",x); r.setAttribute("y",y); r.setAttribute("width",w); r.setAttribute("height",h); r.setAttribute("rx",6);
+    r.setAttribute("fill",fill); r.setAttribute("stroke",stroke); g.appendChild(r);
+    const t=document.createElementNS(NS,"text"); t.setAttribute("x",x+w/2); t.setAttribute("y",y+30); t.setAttribute("text-anchor","middle"); t.setAttribute("class","val-label"); t.textContent=label; g.appendChild(t);
+    if(sub){const s=document.createElementNS(NS,"text"); s.setAttribute("x",x+w/2); s.setAttribute("y",y-10); s.setAttribute("text-anchor","middle"); s.setAttribute("class","axis-label"); s.textContent=sub; g.appendChild(s);}
+  };
+  mk(x0, ctxW, "var(--surface-2)", "var(--border)", "recent past audio (context)", "200 ms · already buffered, reused");
+  mk(x0+ctxW+4, hopW, "color-mix(in srgb,var(--accent) 22%,var(--surface))", "var(--accent)", "new hop", "40 ms");
+  // model span brace
+  const span=document.createElementNS(NS,"path");
+  span.setAttribute("d",`M${x0} ${y+h+16} L${x0} ${y+h+24} L${x0+ctxW+hopW+4} ${y+h+24} L${x0+ctxW+hopW+4} ${y+h+16}`);
+  span.setAttribute("fill","none"); span.setAttribute("stroke","var(--ink-faint)"); g.appendChild(span);
+  const st=document.createElementNS(NS,"text"); st.setAttribute("x",x0+(ctxW+hopW)/2); st.setAttribute("y",y+h+40); st.setAttribute("text-anchor","middle"); st.setAttribute("class","axis-label"); st.textContent="→ whole window fed to model (GRU warms up)"; g.appendChild(st);
+  // keep-only arrow
+  const ar=document.createElementNS(NS,"path"); ar.setAttribute("d",`M${x0+ctxW+hopW/2+4} ${y-2} L${x0+ctxW+hopW/2+4} ${y-22}`); ar.setAttribute("stroke","var(--accent)"); ar.setAttribute("stroke-width","1.5"); ar.setAttribute("marker-end","url(#ah2)"); g.appendChild(ar);
+  const kt=document.createElementNS(NS,"text"); kt.setAttribute("x",x0+ctxW+hopW/2+4); kt.setAttribute("y",y-28); kt.setAttribute("text-anchor","middle"); kt.setAttribute("class","val-label"); kt.style.fill="var(--accent)"; kt.textContent="keep only this output"; g.appendChild(kt);
+  const defs=document.createElementNS(NS,"defs"); defs.innerHTML='<marker id="ah2" markerWidth="8" markerHeight="8" refX="3" refY="6" orient="auto"><path d="M0 6 L3 0 L6 6 z" fill="var(--accent)"/></marker>'; g.appendChild(defs);
+}
+
+/* ---------- bar charts (measured data) ---------- */
+function barChart(sel, data, {ymin, ymax, ceiling, singleHue}){
+  const svg = $(sel); while(svg.firstChild) svg.removeChild(svg.firstChild);
+  const W=900, H=300, padL=48, padR=20, padT=16, padB=54;
+  const plotW=W-padL-padR, plotH=H-padT-padB;
+  const y = v => padT + plotH*(1-(v-ymin)/(ymax-ymin));
+  const bw = plotW/data.length;
+  // gridlines + y labels
+  for(let v=Math.ceil(ymin/3)*3; v<=ymax; v+=3){
+    const ln=document.createElementNS(NS,"line"); ln.setAttribute("x1",padL); ln.setAttribute("x2",W-padR); ln.setAttribute("y1",y(v)); ln.setAttribute("y2",y(v)); ln.setAttribute("class", v===0?"zero":"tick"); svg.appendChild(ln);
+    const tx=document.createElementNS(NS,"text"); tx.setAttribute("x",padL-8); tx.setAttribute("y",y(v)+4); tx.setAttribute("text-anchor","end"); tx.setAttribute("class","axis-label"); tx.textContent=(v>0?"+":"")+v; svg.appendChild(tx);
+  }
+  // ceiling
+  if(ceiling!=null){
+    const cl=document.createElementNS(NS,"line"); cl.setAttribute("x1",padL); cl.setAttribute("x2",W-padR); cl.setAttribute("y1",y(ceiling)); cl.setAttribute("y2",y(ceiling)); cl.setAttribute("stroke","var(--ink-faint)"); cl.setAttribute("stroke-dasharray","5 4"); svg.appendChild(cl);
+  }
+  const zeroY=y(0);
+  data.forEach((d,i)=>{
+    const cx=padL+i*bw+bw*0.5, barW=Math.min(46,bw*0.62);
+    const pos=d.v>=0;
+    const top=pos?y(d.v):zeroY, bot=pos?zeroY:y(d.v);
+    const col = singleHue? css("--accent") : (pos?css("--accent"):css("--neg"));
+    const r=document.createElementNS(NS,"rect");
+    r.setAttribute("x",cx-barW/2); r.setAttribute("y",top); r.setAttribute("width",barW); r.setAttribute("height",Math.max(2,bot-top));
+    r.setAttribute("rx",4); r.setAttribute("fill",col); r.style.cursor="default";
+    r.addEventListener("mousemove",e=>showTip(e.clientX,e.clientY,`${d.label} · <b>${(d.v>0?"+":"")}${d.v.toFixed(1)} dB</b>`));
+    r.addEventListener("mouseleave",hideTip);
+    svg.appendChild(r);
+    // value label
+    const vl=document.createElementNS(NS,"text"); vl.setAttribute("x",cx); vl.setAttribute("y",pos?top-6:bot+15); vl.setAttribute("text-anchor","middle"); vl.setAttribute("class","val-label"); vl.textContent=(d.v>0?"+":"")+d.v.toFixed(1); svg.appendChild(vl);
+    // x label
+    const xl=document.createElementNS(NS,"text"); xl.setAttribute("x",cx); xl.setAttribute("y",H-32); xl.setAttribute("text-anchor","middle"); xl.setAttribute("class","axis-label"); xl.textContent=d.label; svg.appendChild(xl);
+  });
+  // axis title
+  const at=document.createElementNS(NS,"text"); at.setAttribute("x",padL); at.setAttribute("y",H-8); at.setAttribute("class","axis-label"); at.textContent=sel==="#chartA"?"block size (independent processing)":"warm context at fixed 40 ms hop"; svg.appendChild(at);
+  const yt=document.createElementNS(NS,"text"); yt.setAttribute("x",padL-8); yt.setAttribute("y",12); yt.setAttribute("class","axis-label"); yt.textContent="dB gain"; svg.appendChild(yt);
+}
+
+const DATA_A = [
+  {label:"20ms",v:-2.7},{label:"30ms",v:-0.7},{label:"40ms",v:1.5},{label:"60ms",v:3.1},
+  {label:"120ms",v:5.4},{label:"250ms",v:7.9},{label:"500ms",v:9.3},{label:"1000ms",v:10.6},{label:"whole",v:11.6}
+];
+const DATA_B = [
+  {label:"0",v:6.3},{label:"100ms",v:10.9},{label:"200ms",v:11.0},{label:"400ms",v:11.0},{label:"800ms",v:11.0}
+];
+
+/* ---------- init + redraw on theme change ---------- */
+function renderAll(){
+  drawWave(); setSpec(specView);
+  ["#stftwave","#stftcol","#linbins","#erbbands","#dfgrid","#latency","#warmdiag"].forEach(s=>{const e=$(s); if(e) while(e.firstChild) e.removeChild(e.firstChild);});
+  buildSTFT(); buildERB(); buildDF(); buildLatency(); buildWarm();
+  barChart("#chartA", DATA_A, {ymin:-4, ymax:13, ceiling:11.6, singleHue:false});
+  barChart("#chartB", DATA_B, {ymin:0, ymax:13, ceiling:11.6, singleHue:true});
+}
+renderAll();
+// redraw when the viewer flips theme (tokens change → recolor canvases/SVG)
+new MutationObserver(renderAll).observe(document.documentElement,{attributes:true,attributeFilter:["data-theme"]});
+matchMedia("(prefers-color-scheme:dark)").addEventListener("change", renderAll);
+addEventListener("resize", ()=>{drawWave(); setSpec(specView);});
+</script>

@@ -148,6 +148,17 @@ modern encoder default.</li>
 attacks CTC's independence assumption.</li>
 </ol>
 
+<div class="callout prod">
+<span class="label">All of that is now built</span>
+<a href="10-modern-asr.html">Module 6</a> does exactly these things: a Conformer encoder
+with relative-position attention, BPE subwords, and an autoregressive decoder trained
+jointly with CTC — which is the principled version of "shallow LM fusion", since the
+language model is learned on the same encoder rather than bolted on at decode time. It
+also streams, which the BiGRU on this page structurally cannot. Read this page first, then
+that one: the point of keeping both models in the repo is that you can run them on the
+same audio and hear the difference.
+</div>
+
 </main>
 <footer class="nav">
   <a href="02-vad.html">← VAD</a>

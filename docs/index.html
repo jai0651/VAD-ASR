@@ -22,11 +22,14 @@
       ▼  <span class="m">WebSocket binary frames</span>
  ┌─────────────────────────── server (one session) ───────────────────────────┐
  │                                                                             │
+ │  <span class="a">DENOISE</span> ─ mic → cleaner        <span class="m">Module 5 OM-LSA │ prod: GTCRN (23.7K)</span>       │
+ │   │                                                                         │
  │  <span class="a">VAD</span> ─ per-window P(speech)     <span class="m">Module 1 VADNet │ prod: Silero v5</span>          │
  │   │                                                                         │
  │  <span class="a">ENDPOINTER</span> ─ turn detection    <span class="m">hysteresis + debounce + pre-roll</span>            │
  │   │  utterance audio (one turn)                                             │
- │  <span class="b">ASR</span> ─ audio → text             <span class="m">Module 2 CTC BiGRU │ prod: faster-whisper</span>   │
+ │  <span class="b">ASR</span> ─ audio → text             <span class="m">Module 2 CTC BiGRU │ Module 6 Conformer</span>     │
+ │   │                                <span class="m">                   │ prod: faster-whisper</span>   │
  │   │  transcript                                                             │
  │  <span class="c">RESPONDER</span> ─ text → reply       <span class="m">echo (slot for an LLM)</span>                      │
  │   │  reply text, sentence by sentence                                       │
@@ -76,6 +79,41 @@
   <p>Every significant choice made while building this, with the alternatives
   considered, the reasoning, and measured evidence — including the failures
   (MPS 13× slower than CPU here, attention collapse before guided attention).</p>
+</div>
+<div class="card">
+  <h3><a href="07-denoise.html">7 · Noise suppression deep dive</a></h3>
+  <p>Module 5: a streaming denoiser written by hand from MCRA + decision-directed
+  SNR + log-MMSE/OM-LSA, the two bugs that cost 5 dB of speech, and the measured
+  result that noise suppression helps the VAD at every SNR and <em>hurts</em>
+  Whisper at 0 dB.</p>
+</div>
+<div class="card">
+  <h3><a href="08-sota.html">8 · State of the art (2026)</a></h3>
+  <p>What the best open models actually are right now, why those architectures
+  won, the five distinct gaps between these models and production ones (they are
+  not all "data"), open-dataset training recipes that fit on an M4, and where a
+  voice-AI company should actually invest.</p>
+</div>
+<div class="card">
+  <h3><a href="10-modern-asr.html">10 · The modern recognizer</a></h3>
+  <p>Module 6: replacing the 2015 ASR with the 2026 one — Conformer with
+  relative-position attention, BPE subwords, hybrid CTC/attention, streaming by
+  dynamic chunk masking, and the full training recipe. Includes the CTC-plateau
+  debugging story and the test that proves the streaming claim.</p>
+</div>
+<div class="card">
+  <h3><a href="11-vocoder.html">11 · The neural vocoder</a></h3>
+  <p>Module 7: predicting phase instead of iterating toward it. A Vocos-style
+  ConvNeXt + exact inverse STFT that removes the one ceiling in this repo no
+  amount of data can lift — why the loss has no phase term, and why the ISTFT
+  must be exact to machine precision.</p>
+</div>
+<div class="card">
+  <h3><a href="09-turn-detection.html">9 · Beating Smart Turn on telephony</a></h3>
+  <p>A build plan for an 8 kHz-native end-of-turn detector: the documented,
+  still-open bug that proves the gap is real, the trap that would invalidate the
+  whole claim, the telephony augmentation pipeline, and the benchmark protocol
+  that is the real contribution.</p>
 </div>
 
 <h2><span class="num">02</span>How to use this repo to learn</h2>

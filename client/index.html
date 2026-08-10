@@ -52,6 +52,7 @@
   <div id="log"></div>
   <div id="stats">
     <span>vad P(speech) <b id="s-vad">–</b></span>
+    <span>noise removed <b id="s-nr">–</b></span>
     <span>turnaround <b id="s-turn">–</b></span>
     <span>asr <b id="s-asr">–</b></span>
     <span>tts/sentence <b id="s-tts">–</b></span>
@@ -133,8 +134,8 @@ function onEvent(ev) {
     case 'ready': {
       const e = ev.engines || {};
       document.getElementById('sub').textContent =
-        `mic → VAD (${e.vad}) → endpoint → ASR (${e.asr}) → reply (${e.responder}) → TTS (${e.tts}). Interrupt it mid-sentence to see barge-in.`;
-      log('sys', `engines: vad=${e.vad} asr=${e.asr} tts=${e.tts} responder=${e.responder}`);
+        `mic → denoise (${e.denoise}) → VAD (${e.vad}) → endpoint → ASR (${e.asr}) → reply (${e.responder}) → TTS (${e.tts}). Interrupt it mid-sentence to see barge-in.`;
+      log('sys', `engines: denoise=${e.denoise} vad=${e.vad} asr=${e.asr} tts=${e.tts} responder=${e.responder}`);
       break;
     }
     case 'vad': {
@@ -143,6 +144,12 @@ function onEvent(ev) {
       const el = document.getElementById('s-vad');
       el.textContent = ev.prob.toFixed(2);
       el.style.color = ev.prob > 0.5 ? 'var(--warn)' : 'var(--accent)';
+      // Healthy: a lot of dB while your room is idle, only a few while you
+      // talk. Consistently high WHILE you talk means the suppressor is eating
+      // speech — raise VOICE_DENOISE_ATTEN_DB or switch engines.
+      if (ev.nr_db !== undefined) {
+        document.getElementById('s-nr').textContent = ev.nr_db.toFixed(1) + ' dB';
+      }
       break;
     }
     case 'state': setState(ev.state); break;

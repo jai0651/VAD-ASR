@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>7 · Noise Suppression — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>Noise <span>Suppression</span></h1>
+  <p>Module 5: the stage in front of everything. A streaming denoiser written by
+     hand from the classical statistics — and the measurement that proves it
+     helps the VAD, and can hurt the ASR.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← hub</a> · <a href="06-decisions.html">decisions</a></div>
+
+<h2><span class="num">7.1</span>Why this stage exists</h2>
+<p>Every module before this one assumed the microphone was reasonably clean.
+It never is. And the failure mode isn't "the transcript has a typo" — it's the
+bug Module 1b hit: <strong>room ambience read as speech</strong>, so turns never
+closed and phantom barge-ins flushed every reply. Noise doesn't degrade a voice
+agent gracefully; it breaks the turn-taking layer first, and by the time you
+notice the transcript quality you have already lost the conversation.</p>
+
+<p>Noise suppression is also the one place in this pipeline where a
+<em>non-neural</em> algorithm is still genuinely competitive, which makes it the
+best remaining thing to write by hand. The classical method is not a toy version
+of the real thing — it <em>was</em> the real thing on every phone and headset for
+twenty years, and it is still the baseline every paper reports against.</p>
+
+<h2><span class="num">7.2</span>The model of the world</h2>
+<p>Assume noise adds in the STFT domain, per frequency bin, per frame:</p>
+<div class="diagram">Y[k,t]  =  S[k,t]  +  N[k,t]
+noisy      speech     noise</div>
+<p>and estimate a real, non-negative gain <code>G[k,t] ∈ [G_min, 1]</code> to apply:
+<code>Ŝ = G · Y</code>. Phase is left untouched. That single simplification is what
+makes the classical method tractable — and it is exactly the ceiling that modern
+complex-domain models break through.</p>
+
+<p>Everything then reduces to three questions, each answered by one named
+algorithm. They live in <code>src/denoise/spectral.py</code>.</p>
+
+<h3>1. How loud is the noise, right now, per bin?</h3>
+<p>You can't ask the user to be quiet, so you have to estimate the noise floor
+<em>while they talk</em>. The trick is that speech is intermittent: in any given
+band, the <strong>running minimum</strong> of the smoothed power is a decent proxy
+for the noise floor. Where the current power towers over that minimum you're
+probably in speech, so you freeze the noise estimate; elsewhere you update it.
+That's <strong>MCRA</strong> (Minima-Controlled Recursive Averaging), with
+Doblinger's continuous minimum tracker so there's no history buffer — one
+multiply-add per bin, which is why this ships on DSPs.</p>
+
+<div class="callout warn">
+<span class="label">The failure this hides</span>
+Recursive averaging has a nasty trap: if the estimate is ever initialised high
+— e.g. <em>the stream starts mid-word</em>, which for a voice agent is the
+<strong>normal</strong> case — the freeze-during-speech rule keeps it high forever,
+and a too-high noise floor over-suppresses precisely the bands speech lives in.
+Measured here on a LibriSpeech crop starting mid-utterance: <strong>+9 dB of bias
+below 500 Hz</strong>. The fix is Martin's minimum statistics as a safety net —
+cap the estimate at <code>1.5 × S_min</code>, because the minimum of the smoothed
+power cannot be far above the true floor. That one line took speech attenuation
+from 5.1 dB to 4.2 dB, and the parameter sweep that followed took it to 1.7 dB.
+</div>
+
+<h3>2. How much speech is in this bin?</h3>
+<p>The a-priori SNR <strong>ξ</strong>. Estimating it from the current frame alone
+is horribly noisy and produces <strong>musical noise</strong> — random isolated tone
+bursts, the artifact everyone recognises from 1990s spectral subtraction.
+Ephraim &amp; Malah's <strong>decision-directed</strong> estimator averages the
+previous frame's <em>enhanced</em> SNR with this frame's raw estimate:</p>
+<pre><code>ξ = α·(Ĝ²_prev · γ_prev)  +  (1-α)·max(γ - 1, 0)      α = 0.98</code></pre>
+<p>That temporal smoothing is the single most important line in the file. It is
+also the reason α is 0.98 and not 0.9: the gain is allowed to react slowly,
+because a gain that reacts per-frame <em>is</em> musical noise.</p>
+
+<h3>3. Given ξ, what gain is optimal?</h3>
+<p><strong>log-MMSE</strong> (Ephraim &amp; Malah 1985): minimise squared error on
+the <em>log</em> spectrum rather than the linear one, because loudness perception
+is logarithmic. The result is built from the exponential integral E₁ — which we
+implement with the Abramowitz &amp; Stegun rational approximations, since there
+is no scipy here:</p>
+<pre><code>v = ξ/(1+ξ) · γ
+G_lsa = ξ/(1+ξ) · exp(½ · E₁(v))</code></pre>
+
+<h3>4. …and the refinement that kills the residual warble</h3>
+<p><strong>OM-LSA</strong> (Cohen 2003) blends the gain toward the floor using the
+speech-presence probability:
+<code>G = G_lsa<sup>p</sup> · G_min<sup>(1-p)</sup></code>.</p>
+<div class="callout">
+<span class="label">A bug worth remembering</span>
+The blend exponent must be a <em>real</em> speech-presence probability, not the
+MCRA indicator. They answer different questions: the MCRA indicator asks "is
+this band above its own long-run minimum?" (fine for deciding whether to update
+a noise estimate), while the gain needs "given ξ and γ, how likely is speech
+here <em>now</em>?" — Cohen's estimator
+<code>p = 1/(1 + q/(1-q)·(1+ξ)·e<sup>-v</sup>)</code>. Using the indicator directly
+cost 5 dB of speech attenuation, because it never saturates to 1 inside speech,
+so every voiced band got dragged toward the floor.
+</div>
+
+<h2><span class="num">7.3</span>The streaming contract</h2>
+<p>Shared by every engine in <code>src/denoise/</code>: feed consecutive,
+non-overlapping blocks in stream order; <code>process()</code> buffers internally
+to the engine's hop and returns only fully reconstructed hops, so it may return
+fewer samples than you gave it. Output sample <em>i</em> still corresponds to
+input sample <em>i</em> — it just arrives <code>delay</code> samples later. That
+lag <strong>is</strong> the algorithmic latency, and it is not a free parameter:</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>engine</th><th>framing</th><th>delay</th><th>why</th></tr>
+<tr><td><code>spectral</code></td><td>512 / hop 256, sqrt-Hann</td><td>256 (16 ms)</td>
+    <td>periodic Hann applied on analysis <em>and</em> synthesis multiplies back to a full Hann, which sums to exactly 1.0 at 50% overlap — perfect reconstruction, no normalisation pass</td></tr>
+<tr><td><code>gtcrn</code></td><td>512 / hop 256, sqrt-Hann</td><td>256 (16 ms)</td>
+    <td>same shell; the model is frame-in/frame-out with cached state</td></tr>
+<tr><td><code>dtln</code></td><td>512 / hop <strong>128</strong>, rectangular</td><td>384 (24 ms)</td>
+    <td>trained for 75% overlap with the network itself learning to emit frames that overlap-add correctly. Run it at 50% and reconstruction breaks — measured 19 dB SNR in, 6 dB out. <strong>The shift is part of the model, not a tuning knob.</strong></td></tr>
+</table>
+</div>
+
+<p><code>tests/test_denoise.py</code> asserts the declared delay by sending an
+impulse through and finding where it lands. That test exists because the delay
+is what keeps the raw and cleaned streams aligned in
+<code>denoise_target=vad</code>, and a silent 16 ms drift there clips word
+onsets — the exact bug pre-roll exists to prevent.</p>
+
+<h2><span class="num">7.4</span>Where the stage goes, and who gets clean audio</h2>
+<div class="diagram">mic ─▶ <span class="a">[DENOISE]</span> ─▶ <span class="a">VAD</span> ─▶ endpointer ─▶ <span class="b">ASR</span> ─▶ LLM ─▶ <span class="c">TTS</span>
+        <span class="m">│</span>
+        <span class="m">└─ denoise_target = "both" → VAD and ASR both get cleaned audio</span>
+        <span class="m">   denoise_target = "vad"  → VAD gets cleaned, ASR gets the aligned ORIGINAL</span></div>
+
+<p>Mechanically the denoiser is attached as a decorator around the VAD engine
+(<code>src/pipeline/denoise.py</code>). Not an aesthetic choice: the VAD is the
+single point every microphone sample flows through, and the endpointer buffers
+exactly the sample arrays the VAD hands back — so wrapping the VAD is the only
+place where one object can control <em>both</em> what gets scored and what gets
+transcribed.</p>
+
+<h2><span class="num">7.5</span>Does it actually help? (measured)</h2>
+<p><code>scripts/10_denoise_bench.py</code>, 8 LibriSpeech utterances × 3 noise
+types (colored, babble, hum) at 5 dB input SNR, M-series CPU.</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>engine</th><th>ΔSNR</th><th>noise removed in pauses</th><th>speech damaged</th><th>RTF</th><th>latency</th></tr>
+<tr><td>none</td><td>—</td><td>0.0 dB</td><td>0.0 dB</td><td>0</td><td>0 ms</td></tr>
+<tr><td><strong>spectral</strong> (yours)</td><td>+5.31 dB</td><td>8.1 dB</td><td><strong>0.9 dB</strong></td><td>0.004</td><td>16 ms</td></tr>
+<tr><td>gtcrn</td><td>+4.93 dB</td><td>7.3 dB</td><td>2.0 dB</td><td>0.031</td><td>16 ms</td></tr>
+<tr><td>dtln</td><td><strong>+6.85 dB</strong></td><td>7.9 dB</td><td>1.1 dB</td><td>0.015</td><td>24 ms</td></tr>
+</table>
+</div>
+
+<p>ΔSNR alone is a bad summary — an engine that attenuates everything by 20 dB
+scores fine on "noise removed" — so the benchmark reports pause-attenuation and
+speech-attenuation separately. Note the honest read: <strong>on stationary
+synthetic noise the hand-written algorithm is competitive</strong>. That is the
+regime it was designed for. Where it loses is covered in
+<a href="08-sota.html">§8.5</a>: non-stationary noise (a door slam, a keyboard,
+another person talking) is invisible to a minimum-statistics tracker and obvious
+to a trained model.</p>
+
+<h3>Effect on the VAD — unambiguous</h3>
+<div class="tablewrap">
+<table>
+<tr><th>scenario</th><th>none</th><th>spectral</th><th>gtcrn</th><th>dtln</th><th>want</th></tr>
+<tr><td>digital zeros</td><td>0.009</td><td>0.009</td><td>0.009</td><td>0.009</td><td>low</td></tr>
+<tr><td>room noise</td><td>0.054</td><td>0.040</td><td><strong>0.024</strong></td><td>0.033</td><td>low</td></tr>
+<tr><td>babble</td><td>0.510</td><td>0.425</td><td><strong>0.393</strong></td><td>0.523</td><td>low</td></tr>
+<tr><td>mains hum</td><td>0.010</td><td>0.005</td><td><strong>0.003</strong></td><td>0.006</td><td>low</td></tr>
+<tr><td>speech</td><td>0.903</td><td>0.889</td><td>0.900</td><td>0.900</td><td>HIGH</td></tr>
+<tr><td>speech + noise</td><td>0.903</td><td>0.868</td><td>0.916</td><td><strong>0.928</strong></td><td>HIGH</td></tr>
+<tr><td>quiet speech</td><td>0.709</td><td>0.721</td><td><strong>0.732</strong></td><td>0.711</td><td>HIGH</td></tr>
+</table>
+</div>
+<p>Non-speech rows go down, speech rows don't. This is a real fix for Module 1b's
+known soft spots — and it comes for free from a stage that costs 0.4% of a core.</p>
+
+<h3>Effect on the ASR — the surprise</h3>
+<p>Character error rate, Whisper base.en int8, on noisy LibriSpeech:</p>
+<div class="tablewrap">
+<table>
+<tr><th>input SNR</th><th>none</th><th>spectral</th><th>gtcrn</th><th>dtln</th></tr>
+<tr><td>20 dB (near clean)</td><td>0.040</td><td><strong>0.035</strong></td><td>0.040</td><td>0.040</td></tr>
+<tr><td>5 dB</td><td>0.044</td><td><strong>0.037</strong></td><td>0.040</td><td>0.049</td></tr>
+<tr><td>0 dB (n=24)</td><td><strong>0.068</strong></td><td>0.079</td><td>0.070</td><td>—</td></tr>
+</table>
+</div>
+
+<div class="callout prod">
+<span class="label">The counter-intuitive result</span>
+At the SNR where you most want help, the classical front-end <strong>hurts</strong>
+Whisper — 0.068 → 0.079 CER. Whisper was trained on 680k hours of real-world
+audio <em>including</em> noise, so it has learned to hear through it; a denoiser
+hands it spectral artifacts it has never seen. That is an out-of-distribution
+input, the same failure mode as Module 1b, arriving from the other direction.
+GTCRN is neutral (0.070) because it damages speech less. Meanwhile the scratch
+ASR — trained on clean LibriSpeech — mildly <em>prefers</em> denoised input.
+<br><br>
+Hence the default <code>VOICE_DENOISE_TARGET=vad</code>: take the certain win
+(VAD, every engine, every SNR), skip the uncertain loss (ASR).
+</div>
+
+<h2><span class="num">7.6</span>Config</h2>
+<pre><code># the from-scratch engine, cleaning only what the VAD sees (defaults)
+uv run python -m server.app
+
+# production engine, everything downstream gets cleaned audio
+VOICE_DENOISE_ENGINE=gtcrn VOICE_DENOISE_TARGET=both uv run python -m server.app
+
+# off, to measure the difference on your own voice
+VOICE_DENOISE_ENGINE=none uv run python -m server.app
+
+# keep more residual noise (gain floor); lower = gentler
+VOICE_DENOISE_ATTEN_DB=12 uv run python -m server.app</code></pre>
+
+<p>The browser client shows <strong>noise removed (dB)</strong> next to
+P(speech). Healthy: a lot of dB while your room is idle, only a few while you
+talk. Consistently high <em>while you talk</em> means the suppressor is eating
+speech.</p>
+
+<h2><span class="num">7.7</span>What this doesn't do</h2>
+<ul>
+<li><strong>Echo cancellation (AEC).</strong> Completely different problem: the
+interference is a signal you already have (your own TTS output), so you cancel it
+adaptively rather than estimate it statistically. The browser's WebRTC AEC does
+it for us; a telephony deployment must do it itself.</li>
+<li><strong>Dereverberation.</strong> Reverb is convolutive, not additive — our
+whole model of the world is wrong for it. Needs WPE or a model trained on RIRs.</li>
+<li><strong>Speaker separation.</strong> Babble is still our worst case
+(P(speech) 0.39–0.52 even after suppression) because the interferer <em>is</em>
+speech. That needs target-speaker extraction conditioned on an enrolment
+embedding, which is a different architecture entirely.</li>
+<li><strong>Wideband/fullband.</strong> Everything here is 16 kHz. Telephony is
+8 kHz μ-law and consumer audio is 48 kHz; both change which model wins.</li>
+</ul>
+
+<p>The standalone <code>denoiser/</code> project in this repo is the same
+technology pointed at a different target: your real mic → cleaned → a virtual
+audio device, so Zoom/Meet/a softphone hears only your voice. It carries the
+VoiceBank-DEMAND benchmark (PESQ/STOI/SI-SDR on real recorded noise) that
+justified picking GTCRN as the production default here.</p>
+
+</main>
+<footer class="nav">
+  <a href="06-decisions.html">← Decision log</a>
+  <a href="08-sota.html">Next: State of the art →</a>
+</footer>
+</body>
+</html>
