@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>10 · The Modern ASR — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>The Modern <span>Recognizer</span></h1>
+  <p>Module 6: replacing the 2015 architecture with the 2026 one — Conformer,
+     subwords, hybrid CTC/attention, streaming by construction — so that the
+     only thing still separating us from a production model is data.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← contents</a> · <a href="00-crux.html">the crux</a> · <a href="08-sota.html">state of the art</a> · <a href="03-asr.html">module 2 asr</a></div>
+
+<h2><span class="num">10.1</span>Start from the failure</h2>
+
+<p>Here is Module 2 — a CTC BiGRU, trained on real LibriSpeech — transcribing a
+real utterance:</p>
+
+<pre><code>hyp: he inl san er mianthes tlen kis roint the stieia sord meai wen
+ref: but in less than five minutes the staircase groaned beneath an
+     extraordinary weight</code></pre>
+
+<p>Before reading on, it is worth asking what <em>kind</em> of failure that is.
+It would be easy to say "it needs more data" and move on. But look closely:
+the rhythm is roughly right, the syllable count is roughly right, many vowels
+are roughly right. This is not a model that cannot hear. It is a model that
+hears reasonably and then writes something no English speaker could produce.</p>
+
+<p>Diagnose it properly and there are <strong>four separate defects</strong>,
+only one of which more data would help:</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>#</th><th>defect</th><th>the evidence</th><th>would more data fix it?</th></tr>
+<tr><td>1</td><td><strong>No language model.</strong> CTC predicts each frame independently, so nothing knows that "mianthes" is not a word</td><td>orthographically impossible output</td><td>no — it is structural</td></tr>
+<tr><td>2</td><td><strong>Lossy long-range memory.</strong> A GRU squeezes all history through one fixed-size state</td><td>context beyond a few words is unavailable</td><td>no</td></tr>
+<tr><td>3</td><td><strong>Cannot stream, at any setting.</strong> Bidirectional means frame 1's output depends on frame N's input</td><td>unusable in a live agent</td><td>no</td></tr>
+<tr><td>4</td><td><strong>Cannot absorb more data.</strong> No augmentation, no LR schedule, character targets</td><td>held-out error stayed high while training error fell</td><td><em>this is the one</em> — and it is gated on fixing the others first</td></tr>
+</table>
+</div>
+
+<div class="crux-q">
+<strong>The point of this chapter.</strong> <a href="08-sota.html">§8</a>
+concluded ASR was the one stage where the gap was "everything at once". Three of
+those four defects are <em>architectural</em> — no quantity of audio touches them.
+So the honest order of work is: fix the architecture first, and only then does
+"get more data" become the correct next move. Every row in the table below is
+the answer to one diagnosed defect, not a modernisation for its own sake.
+</div>
+
+<h2><span class="num">10.1b</span>One row per defect, and its fix</h2>
+
+<div class="tablewrap">
+<table>
+<tr><th></th><th>Module 2 (2015 design)</th><th>Module 6 (2026 design)</th><th>why it mattered</th></tr>
+<tr><td>encoder</td><td>2×Conv1d + 2-layer BiGRU</td><td>Conformer × 12</td>
+    <td>a GRU squeezes all history through one fixed state; attention doesn't</td></tr>
+<tr><td>positions</td><td>implicit (recurrence)</td><td>relative, Transformer-XL style</td>
+    <td>"30 ms earlier" generalises across lengths; "frame 412" does not</td></tr>
+<tr><td>tokens</td><td>28 characters</td><td>256–1024 BPE subwords</td>
+    <td>3× shorter targets and orthography it cannot get wrong</td></tr>
+<tr><td>objective</td><td>CTC alone</td><td>0.3·CTC + 0.7·attention</td>
+    <td>CTC has no language model; the decoder is one</td></tr>
+<tr><td>streaming</td><td>impossible (bidirectional)</td><td>dynamic chunk masking</td>
+    <td>one model, offline and streaming, chosen at inference</td></tr>
+<tr><td>augmentation</td><td>none</td><td>SpecAugment + speed + noise</td>
+    <td>worth more than doubling the corpus, under ~1000 h</td></tr>
+<tr><td>schedule</td><td>fixed Adam LR</td><td>warmup + cosine, accumulation</td>
+    <td>attention models diverge at step 0 without warmup</td></tr>
+<tr><td>selection</td><td>last checkpoint</td><td>best + averaged last N</td>
+    <td>"last" is not "best" — measured twice already in this repo</td></tr>
+<tr><td>decoding</td><td>CTC prefix beam, linear space</td><td>log-space beam + attention rescoring</td>
+    <td>linear space underflows to 0.0 by frame ~300</td></tr>
+</table>
+</div>
+
+<h2><span class="num">10.2</span>Subwords: the cheapest large win — defect 1, part one</h2>
+<p>Return to "mianthes". A <em>character</em> model has to learn English spelling
+through the acoustic model, from scratch, from a few hours of audio — every
+letter is an independent decision, so nothing prevents a sequence of individually
+plausible letters from forming an impossible word.</p>
+<p>There are two ways to attack that, and we use both. The decoder in §10.5 is
+the heavyweight fix. The cheap one comes first: <strong>change what a "symbol"
+is.</strong></p>
+<p>BPE (<code>src/asr/tokenizer.py</code>, ~150 lines, no dependency) fixes this
+structurally. Start with characters; repeatedly merge the most frequent adjacent
+pair; stop at <em>V</em> tokens. The model then emits <code>▁recogn</code> +
+<code>ition</code> as atomic units and cannot misspell inside them. Targets also
+get ~3× shorter, which directly cuts decoder steps — i.e. latency.</p>
+<div class="callout">
+<span class="label">The detail that makes it lossless</span>
+The <code>▁</code> word-start marker. Without it, "▁a ▁cat" and "▁ac at" decode
+to the same string and detokenization has to guess. With it, decoding is
+"concatenate everything, turn ▁ into a space" — exact, always.
+</div>
+
+<h2><span class="num">10.3</span>The Conformer block — defect 2</h2>
+<div class="diagram">x ← x + ½·<span class="a">FFN</span>(x)        <span class="m">macaron: half a feed-forward before…</span>
+x ← x + <span class="b">MHSA</span>(x)          <span class="m">global context, RELATIVE positions</span>
+x ← x + <span class="c">Conv</span>(x)          <span class="m">local context, depthwise, kernel 31 ≈ 150 ms</span>
+x ← x + ½·<span class="a">FFN</span>(x)        <span class="m">…and half after</span>
+x ← LayerNorm(x)</div>
+
+<p>The premise is that self-attention and convolution are <em>complementary</em>,
+not competing. Attention is excellent at long-range dependencies and bad at the
+short, translation-invariant patterns that carry phonetic identity — formant
+transitions, plosive bursts. A depthwise conv is the reverse. Conformer uses
+both in every block instead of choosing.</p>
+
+<h3>Relative positional attention</h3>
+<p>Absolute sinusoids tell the model "this is frame 412", which is meaningless
+for speech; what matters is that one frame is 30 ms after another. In the
+Transformer-XL formulation the score decomposes into a content-content term and
+a content-position term, and the position term is produced by <em>shifting</em>
+a single positional matrix rather than indexing per pair:</p>
+<pre><code>scores = (q+u)·kᵀ  +  rel_shift( (q+v)·pᵀ )</code></pre>
+<p><code>rel_shift</code> is pure index bookkeeping: row <em>t</em> arrives
+holding scores against offsets +(T−1)…−(T−1) and must end up holding scores
+against absolute keys 0…T−1. Padding by one column and reshaping performs that
+diagonal shift in two ops instead of a gather. This is why a Conformer trained
+on 10 s utterances still works on 30 s ones.</p>
+
+<h3>×4 conv subsampling</h3>
+<p>Two strided 2-D convs turn 100 frames/s into 25. Not only a speed trick:
+attention is O(T²), so ×4 subsampling is a <strong>16×</strong> reduction in
+attention cost. It is what makes self-attention affordable for audio at all.
+(FastConformer pushes this to ×8 with depthwise-separable convs — the single
+biggest remaining efficiency win available to this code.)</p>
+
+<h2><span class="num">10.4</span>Streaming — defect 3</h2>
+<p>Module 2's BiGRU could not stream at any setting: bidirectional means the
+first frame's output depends on the last frame's input. Module 6 streams by
+construction, using two mechanisms that must both hold:</p>
+<ul>
+<li><strong>Dynamic chunk masking.</strong> Each frame may attend only within
+its own chunk plus some chunks of history. During <em>training</em> the chunk
+size is resampled every batch (half the batches use full context), so one model
+learns every operating point. At inference you pick the chunk — 640 ms for
+responsiveness, 0 for best WER — with no retraining. The alternative is
+training and shipping two models.</li>
+<li><strong>Causal depthwise convolution.</strong> Left padding only. Without
+it, the conv module leaks ~15 frames of future into every block, and the chunk
+mask is a fiction.</li>
+</ul>
+
+<div class="callout warn">
+<span class="label">Claims about streaming need a test, not a comment</span>
+<code>test_chunked_encoder_is_truly_causal</code> encodes 400 frames, then
+encodes just the first 200, and asserts the overlapping outputs are
+<em>identical</em>. If appending future audio changes an already-emitted frame,
+every streaming latency number you report is a lie. This is the easiest thing
+in a Conformer to get silently wrong — one wrong mask broadcast does it.
+<br><br>
+And it is guarded by <code>test_non_causal_conv_breaks_causality</code>, which
+asserts the same comparison <em>fails</em> with a symmetric kernel. A test that
+passes for the wrong reason is worse than no test; this proves the first one is
+actually measuring something.
+</div>
+
+<h2><span class="num">10.5</span>Two heads on one encoder — defect 1, part two</h2>
+<div class="diagram">feats ─▶ <span class="a">Conformer encoder</span> ─┬─▶ <span class="b">CTC head</span>         ─▶ L_ctc   <span class="m">alignment</span>
+                            └─▶ <span class="c">Transformer dec</span>  ─▶ L_att   <span class="m">language</span>
+
+L = 0.3·L_ctc + 0.7·L_att</div>
+
+<p>CTC's defining assumption is <strong>conditional independence</strong>: given
+the audio, each frame's label is predicted without reference to its neighbours.
+That is what makes the loss a tractable dynamic program, and it is exactly why
+"mianthes" was possible — nothing in the model knows a 'q' is followed by a 'u'.
+An autoregressive decoder is precisely the missing piece.</p>
+<p>Each head fixes the other's failure mode. CTC is monotonic by construction,
+so it stops the attention from wandering or looping — the same failure
+<a href="04-tts.html">Module 4's TTS</a> needed guided attention to avoid. The
+decoder supplies the implicit language model. One encoder pays for both.</p>
+
+<h3>Attention rescoring</h3>
+<p>Decoding uses the same split in two passes: CTC prefix beam search proposes
+an n-best list (fast, monotonic, streaming-compatible), then the decoder scores
+all <em>n</em> hypotheses in a <strong>single batched forward</strong>. That is
+far cheaper than an autoregressive beam search, which evaluates the decoder once
+per output token per beam.</p>
+
+<h2><span class="num">10.6</span>The CTC plateau — a debugging story worth keeping</h2>
+<p>First real run: CTC loss dropped 16.8 → 5.5 in fifty steps and then sat
+there. 800 steps later it was still ~5.0. With a 256-token vocabulary,
+ln(256) = 5.55 — so the model had learned <em>almost nothing</em>, while the
+attention loss fell steadily to 4.15 (it was learning unigram statistics from
+the text alone, which needs no audio at all).</p>
+<p>That looks exactly like a broken gradient path, and there was a prime
+suspect: <code>aten::_ctc_loss</code> has no MPS kernel, so we route that one op
+through the CPU. A direct check ruled it out — CTC-only gradients on MPS matched
+CPU to three digits at every depth. The real answer came from the standard
+diagnostic instead:</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>60 utterances, tiny model</th><th>step 100</th><th>step 200</th><th>step 300</th><th>step 400</th></tr>
+<tr><td>CTC loss, no augmentation</td><td>5.05</td><td>4.44</td><td>1.17</td><td><strong>0.13</strong></td></tr>
+<tr><td>CTC loss, SpecAugment from step 0</td><td>5.06</td><td>4.78</td><td>3.50</td><td>1.06</td></tr>
+</table>
+</div>
+
+<p>Two facts fall out. First, the model is fine — with no augmentation it goes
+from 5.05 to 0.13 and transcribes its training set perfectly. Second, <strong>CTC
+has a characteristic plateau</strong>: it sits near uniform for a few hundred
+steps while it hunts for <em>any</em> alignment, then falls off a cliff. On 60
+utterances that took ~250 steps; on 2300 with augmentation and chunk masking it
+takes thousands. The 800-step run had simply ended during the plateau.</p>
+
+<div class="callout prod">
+<span class="label">Two things this changed in the code</span>
+<strong>Augmentation warmup</strong> (<code>AUG_START</code>): regularising a
+model that has not yet learned the task only lengthens the plateau, so
+SpecAugment and noise now switch on after the alignment forms. And the
+diagnostic itself is worth keeping as a habit — <em>before</em> a long run, check
+that the model can overfit 60 utterances. It distinguishes "stalled" from
+"broken" in four minutes, and it is why <code>test_overfits_a_tiny_batch</code>
+exists in the test suite.
+</div>
+
+<h2><span class="num">10.7</span>The training recipe</h2>
+<div class="tablewrap">
+<table>
+<tr><th>knob</th><th>setting</th><th>why</th></tr>
+<tr><td>SpecAugment</td><td>2 freq masks ≤27 bins, 2 time masks ≤5%</td><td>forces inference from partial evidence; the highest-leverage line in any small-data recipe</td></tr>
+<tr><td>speed perturb</td><td>0.9 / 1.0 / 1.1</td><td>triples the corpus, and shifts pitch — so it is really <em>speaker</em> augmentation, the axis a small corpus lacks</td></tr>
+<tr><td>noise mixing</td><td>25–30% of utterances, 5–20 dB SNR</td><td>reuses Module 1b's generators; insurance against studio-only training</td></tr>
+<tr><td>CMVN</td><td>per utterance</td><td>log-mel has a per-recording gain offset; without this the model burns capacity learning to subtract a constant</td></tr>
+<tr><td>batching</td><td>by total frames, length-bucketed</td><td>batching by count pads twelve 2 s clips to 20 s; 2–4× more real audio per step at the same memory</td></tr>
+<tr><td>LR</td><td>warmup then cosine, peak 1e-3</td><td>at step 0 attention is uniform, so softmax gradients are large and badly scaled; full LR there reliably diverges</td></tr>
+<tr><td>grad clip</td><td>5.0</td><td>CTC produces occasional enormous gradients on bad alignments</td></tr>
+<tr><td>ckpt averaging</td><td>last 5</td><td>SGD near convergence orbits a basin; averaging the orbit approximates its bottom</td></tr>
+</table>
+</div>
+
+<h2><span class="num">10.75</span>Measured: did any of it work?</h2>
+<p>All three recognizers over the <strong>same 40 held-out dev-clean
+utterances</strong> (<code>scripts/13_asr_compare.py</code>). Module 6 saw the
+same 4.1 hours of training audio Module 2 did — only the architecture and recipe
+changed.</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>engine</th><th>WER</th><th>CER</th><th>RTF</th><th>training data</th></tr>
+<tr><td>scratch (Module 2) — Conv1d+BiGRU, CTC, chars</td><td>1.076</td><td>0.658</td><td>0.011</td><td>4.1 h</td></tr>
+<tr><td><strong>conformer (Module 6)</strong> — offline</td><td><strong>0.607</strong></td><td><strong>0.276</strong></td><td><strong>0.004</strong></td><td>4.1 h</td></tr>
+<tr><td>conformer (Module 6) — streaming, 640 ms</td><td>0.627</td><td>0.284</td><td>0.004</td><td>4.1 h</td></tr>
+<tr><td>whisper base.en int8</td><td>0.033</td><td>0.017</td><td>0.052</td><td>~680 000 h</td></tr>
+</table>
+</div>
+
+<p>Four things fall out of that table:</p>
+<ul>
+<li><strong>The architecture change halved the error on identical data.</strong>
+WER 1.076 → 0.607 (44% relative), CER 0.658 → 0.276 (58% relative). No extra
+audio, no extra epochs of it — just Conformer, subwords, a second head, and the
+recipe.</li>
+<li><strong>Streaming is nearly free.</strong> 0.607 → 0.627 for 640 ms of
+lookahead: 3% relative. Dynamic chunk training delivered on its promise, and
+Module 2 could not do this <em>at any cost</em>.</li>
+<li><strong>It is also 2.7× faster</strong> (RTF 0.011 → 0.004), despite being
+2× bigger. That is the ×4 subsampling: attention is O(T²), so quartering T is
+the dominant term.</li>
+<li><strong>Whisper is still 18× better</strong> — on 165 000× the data. That
+ratio <em>is</em> the answer to "what's left?".</li>
+</ul>
+
+<p>The transcripts make it concrete. Same utterance, same audio:</p>
+<pre><code>ref                he gave up work some time ago i have been told my husband
+                   went on but evidently a great case still has its allurement
+                   for him
+
+scratch (M2)       ha a woulwurs ao o at oo eou de hca t heme on o tmac
+                   theagrytt ass haosasar menour o
+conformer (M6)     he gave work xomeetim go a ab intlded myas been my done but
+                   evenently agreat cas still has itsllernent for him
+whisper base.en    he gave up work some time ago i have been told my husband
+                   went on but evidently a great case still has its alignment
+                   for him</code></pre>
+
+<p>Module 2 produces phoneme soup. Module 6 produces <em>English</em> — "he gave
+work", "still has", "for him" are exactly right, and the errors are now
+word-shaped rather than letter-shaped, which is precisely what subwords plus an
+autoregressive decoder are supposed to buy. (Note Whisper's one error:
+"alignment" for "allurement" — a language-model error, not an acoustic one. Even
+680 000 hours guesses when the acoustics are ambiguous.)</p>
+
+<div class="callout warn">
+<span class="label">A recipe step that backfired, and the fix</span>
+Checkpoint averaging <strong>hurt</strong>: averaging the last 5 checkpoints gave
+WER 0.659 against a best single checkpoint of 0.612. The premise of averaging is
+that SGD near convergence orbits one basin — but with <code>EVAL_EVERY=1000</code>
+those five checkpoints spanned the whole run (WER 0.86 → 0.61). They were
+different basins, not one orbit, and averaging a half-trained model into a
+trained one is just damage. Fixed by averaging the <strong>best-K by held-out
+WER</strong> (what ESPnet's n-best averaging does) and keeping the result only if
+it actually wins. The guard mattered more than the technique: the script never
+shipped the worse model, because it always re-scores before saving.
+</div>
+
+<h2><span class="num">10.8</span>What is still not state of the art</h2>
+<p>Honest list, in order of how much it costs you:</p>
+<ol>
+<li><strong>Data.</strong> This is now the dominant term, which was the goal.
+LibriSpeech dev-clean is 4 h; Parakeet saw ~640 k h. See §10.9.</li>
+<li><strong>No transducer head.</strong> Parakeet's TDT emits a token
+<em>and</em> a duration per step, skipping frames instead of emitting blanks.
+That is the throughput trick, and it needs a transducer loss we don't have.</li>
+<li><strong>×4, not ×8 subsampling.</strong> FastConformer's depthwise-separable
+×8 front-end roughly halves encoder cost at equal accuracy.</li>
+<li><strong>No external language model.</strong> Shallow fusion with an n-gram
+or a small neural LM during beam search is a standard 5–15% relative WER win.</li>
+<li><strong>fp32 only.</strong> bf16 would roughly double throughput on
+supported hardware.</li>
+<li><strong>No BPE dropout, no SpecAugment++ / adaptive masking.</strong></li>
+</ol>
+
+<h2><span class="num">10.9</span>Training it for real, on free public data</h2>
+<p>Everything below runs with this one script; only <code>SPLIT</code> and the
+step count change. This is the ladder from "the loop runs" to "a usable model".</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>stage</th><th>data</th><th>command</th><th>expect</th></tr>
+<tr><td>smoke</td><td>dev-clean, 4 h</td><td><code>SIZE=tiny STEPS=6000</code></td><td>the loop runs; heavy overfit; WER stays high</td></tr>
+<tr><td>real</td><td>train-clean-100</td><td><code>SPLIT=train-clean-100 DOWNLOAD=1 SIZE=small STEPS=40000</code></td><td>a genuine recognizer; ~1 day on an M4</td></tr>
+<tr><td>serious</td><td>train-960</td><td>concatenate the three train splits</td><td>WER in the single digits; wants a rented GPU-day</td></tr>
+<tr><td>beyond</td><td>+ People's Speech, Common Voice, YODAS, Granary</td><td>extend <code>build_manifest</code></td><td>accent/channel robustness — where real-world WER actually comes from</td></tr>
+</table>
+</div>
+
+<p>Two notes on scaling that are easy to get wrong:</p>
+<ul>
+<li><strong>Grow the vocabulary with the data.</strong> 256 subwords suits a few
+hours; 100 h wants ~1024, and 960 h wants 2048–5000. Too large a vocabulary on
+too little data leaves most tokens with a handful of examples each.</li>
+<li><strong>Grow the model with the data, not before it.</strong>
+<code>SIZE=small</code> is ~30 M parameters. On 4 hours that memorises the
+speakers; on 100 h it is about right; on 960 h go to <code>base</code>. Scaling
+the model first just produces a more confident overfit.</li>
+</ul>
+
+<h2><span class="num">10.10</span>Using it</h2>
+<pre><code># train
+uv run python scripts/11_train_asr_conformer.py
+SPLIT=train-clean-100 DOWNLOAD=1 SIZE=small STEPS=40000 VOCAB=1024 \
+  uv run python scripts/11_train_asr_conformer.py
+
+# run it in the live agent, offline decoding
+VOICE_ASR_ENGINE=conformer uv run python -m server.app
+
+# …or streaming with 640 ms of lookahead — same weights, no retraining
+VOICE_ASR_ENGINE=conformer VOICE_CONFORMER_CHUNK=16 uv run python -m server.app</code></pre>
+
+<p>The script's final report prints the three numbers that characterise a
+streaming recognizer, and the gaps between them are the interesting part:
+CTC greedy, + attention rescoring (what the second head buys), and streaming at
+a fixed chunk (what the latency costs).</p>
+
+</main>
+<footer class="nav">
+  <a href="05-production.html">← Production</a>
+  <a href="12-training-run.html">Next: What we are training →</a>
+</footer>
+</body>
+</html>

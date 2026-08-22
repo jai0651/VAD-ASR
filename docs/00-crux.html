@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>0 · The Crux — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+<style>
+  .crux { border-left: 3px solid var(--green); background: var(--card-2);
+          border-radius: 0 10px 10px 0; padding: 14px 18px; margin: 18px 0; }
+  .crux .label { font-family: var(--mono); font-size: 12px; letter-spacing: .08em;
+                 text-transform: uppercase; color: var(--green); display: block;
+                 margin-bottom: 6px; }
+  .q { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+       padding: 16px 20px; margin: 14px 0; }
+  .q > .ask { color: var(--accent-2); font-weight: 600; margin-bottom: 8px;
+              display: block; font-size: 16px; }
+  .fail { border-left: 3px solid var(--red); background: var(--card);
+          border-radius: 0 10px 10px 0; padding: 12px 16px; margin: 12px 0; }
+  .fail .what { color: var(--red); font-family: var(--mono); font-size: 12.5px;
+                text-transform: uppercase; letter-spacing: .06em; }
+  .lesson { color: var(--green); }
+</style>
+</head>
+<body>
+<header class="hero">
+  <h1>The <span>Crux</span></h1>
+  <p>The synthesis chapter. What this project actually taught, the mistakes that
+     taught it, the mental models worth keeping, and how to explain any of it to
+     someone else. Read this first, or read it last — it works both ways.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← contents</a> · <a href="00-crux.html">the crux</a></div>
+
+<h2><span class="num">0.1</span>The project in three sentences</h2>
+<p>A complete real-time voice agent — noise suppression, voice activity
+detection, turn detection, speech recognition, a language model, and speech
+synthesis — with <strong>every model built from scratch</strong> and a
+production-grade alternate behind the same interface, so the two can be run on
+the same audio and compared.</p>
+<p>The scratch models exist to be understood and then replaced; the
+<em>pipeline</em> around them — orchestration, barge-in, endpointing, latency
+budgeting — is the part that is genuinely production-shaped and genuinely ours.</p>
+<p>The most valuable output is not any model. It is a catalogue of
+<strong>specific, measured failures</strong> and what each one taught.</p>
+
+<h2><span class="num">0.2</span>Mind map — the whole stack</h2>
+<div class="diagram">                        ┌─────────── VOICE AGENT ───────────┐
+                        │                                   │
+        ┌───────────────┴───────────┐           ┌───────────┴──────────────┐
+        │      HEARING              │           │      SPEAKING            │
+        └───────────────┬───────────┘           └───────────┬──────────────┘
+                        │                                   │
+   <span class="a">DENOISE</span> ──▶ <span class="a">VAD</span> ──▶ <span class="w">ENDPOINT</span> ──▶ <span class="b">ASR</span> ──▶ <span class="c">LLM</span> ──▶ <span class="g">TTS</span> ──▶ <span class="g">VOCODER</span>
+   <span class="m">Mod 5</span>      <span class="m">Mod 1</span>     <span class="m">Mod 3</span>       <span class="m">Mod 2/6</span>   <span class="m">—</span>      <span class="m">Mod 4</span>    <span class="m">Mod 7</span>
+      │          │          │            │               │         │
+  "is it      "is this   "have they   "what words?"   "how do   "make it
+   cleaner?"   speech?"   finished?"                   I say     sound like
+                                                       it?"      a person"
+      │          │          │            │               │         │
+  OM-LSA     conv net   state machine  Conformer     Tacotron   ISTFT/Vocos
+  <span class="m">0 params</span>   <span class="m">55K</span>        <span class="m">no model</span>       <span class="m">28M</span>          <span class="m">3.3M</span>       <span class="m">3.5M</span>
+
+        <span class="w">ORCHESTRATOR</span> wraps all of it — the state machine, barge-in,
+        and the rule that ASR/TTS never block the event loop.
+        <span class="m">This is the part with no paper, and the part that makes it a product.</span></div>
+
+<div class="crux">
+<span class="label">Crux</span>
+Every box is a <em>different kind of problem</em>. VAD is classification.
+Endpointing is <strong>policy, with no model at all</strong>. ASR is sequence
+transduction with an alignment problem. TTS is the same alignment problem
+mirrored — it must <em>decide</em> durations instead of discovering them. Knowing
+which kind of problem you are looking at tells you which tools apply.
+</div>
+
+<h2><span class="num">0.3</span>Mind map — the ASR model</h2>
+<div class="diagram">   audio ──▶ log-mel ──▶ SUBSAMPLE ×4 ──▶ 12 × CONFORMER ──┬──▶ CTC head
+                          <span class="m">100/s → 25/s</span>        <span class="m">block</span>            │    <span class="m">where things ARE</span>
+                          <span class="m">16× cheaper</span>                          │
+                          <span class="m">attention</span>                            └──▶ DECODER
+                                                              <span class="m">what is SAID</span>
+
+   ONE CONFORMER BLOCK
+   ┌──────────────────────────────────────────────────────────┐
+   │  ½ FFN  →  SELF-ATTENTION  →  CONVOLUTION  →  ½ FFN      │
+   │  <span class="m">526K</span>       <span class="m">329K</span>                <span class="m">207K</span>            <span class="m">526K</span>        │
+   │             <span class="m">global context</span>      <span class="m">local, 1.24 s</span>                │
+   │             <span class="m">relative pos.</span>       <span class="m">causal ⇒ streams</span>             │
+   └──────────────────────────────────────────────────────────┘
+        <span class="m">⅔ of the block is feed-forward. Attention is the SMALLEST learned part.</span>
+
+   WHY TWO HEADS
+   CTC        monotonic, fast, streams   ✗ no language model  → "mianthes"
+   DECODER    language model             ✗ attention can wander / loop
+   TOGETHER   each covers the other's structural weakness, one encoder pays</div>
+
+<h2><span class="num">0.4</span>The crux of each module — one idea, one number</h2>
+<div class="tablewrap">
+<table>
+<tr><th>module</th><th>the one idea</th><th>the one number</th></tr>
+<tr><td><a href="01-pipeline.html">1 · Pipeline</a></td>
+    <td>Barge-in dictates the entire threading model. If ASR/TTS run on the event loop, the agent literally cannot hear you while it talks.</td>
+    <td>turnaround = endpoint wait + ASR + LLM + TTS-first-chunk</td></tr>
+<tr><td><a href="02-vad.html">2 · VAD</a></td>
+    <td>For small speech models, <strong>the data IS the model.</strong> Same architecture, different data, bug fixed.</td>
+    <td>P(speech) on room noise: 1.0 → 0.04</td></tr>
+<tr><td><a href="03-asr.html">3 · ASR (CTC)</a></td>
+    <td>Alignment is the whole subject. CTC's blank makes summing over all alignments tractable.</td>
+    <td>WER 1.076 — phoneme soup</td></tr>
+<tr><td><a href="04-tts.html">4 · TTS</a></td>
+    <td>ASR mirrored: attention must <em>decide</em> duration. Guided attention is a prior that says "time moves forward".</td>
+    <td>ASR-judge CER 0.61, chosen at step 8000 of 10000</td></tr>
+<tr><td><a href="05-production.html">5 · Production</a></td>
+    <td>p95, not average. Latency is long-tailed and users feel the tail.</td>
+    <td>whisper base.en int8: RTF 0.08</td></tr>
+<tr><td><a href="07-denoise.html">7 · Denoise</a></td>
+    <td>The only stage where a 0-parameter classical algorithm is still competitive — and where a learned model wins by <em>recognising</em> noise rather than assuming it is stationary.</td>
+    <td>+5.3 dB SNR, 0.9 dB speech damage</td></tr>
+<tr><td><a href="08-sota.html">8 · State of the art</a></td>
+    <td>"The gap is data" is <strong>false as a general claim.</strong> It's data for VAD, architecture for TTS, and everything at once for ASR.</td>
+    <td>Whisper: 680,000 h vs our 100</td></tr>
+<tr><td><a href="10-modern-asr.html">10 · Modern ASR</a></td>
+    <td>Architecture change halved the error on identical data — and added streaming for 3% relative.</td>
+    <td>WER 1.076 → 0.607, RTF 2.7× faster</td></tr>
+<tr><td><a href="11-vocoder.html">11 · Vocoder</a></td>
+    <td>Griffin-Lim is a ceiling <em>no amount of data can lift</em>, because the limitation isn't in a learned component.</td>
+    <td>+5.4 dB SI-SDR (phase), −0.15 mr-stft (magnitude)</td></tr>
+<tr><td><a href="12-training-run.html">12 · Training</a></td>
+    <td>Warmup is not decoration. Too-fast LR locks CTC into the all-blank minimum permanently.</td>
+    <td>warmup 1,500 vs the reference 15,000</td></tr>
+</table>
+</div>
+
+<h2><span class="num">0.5</span>The failure catalogue — the actual education</h2>
+<p>Everything below was measured, not read. Grouped by the lesson, because the
+lesson repeats across very different-looking bugs.</p>
+
+<h3>Theme 1 — the metric was lying to you</h3>
+
+<div class="fail">
+<span class="what">Failure · the vocoder metric was rigged in the baseline's favour</span>
+We scored a neural vocoder against Griffin-Lim on multi-resolution STFT
+distance. Griffin-Lim <em>lost</em> on phase and <em>won</em> the comparison —
+because MR-STFT is a <strong>magnitude</strong> metric, and magnitude
+consistency is literally Griffin-Lim's optimisation objective.
+<br><span class="lesson">Lesson: check whether your metric measures the thing your
+baseline optimises. Adding SI-SDR (time-domain, phase-sensitive) reversed the
+result: +5.4 dB for the neural model.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · CTC loss "should" start near ln(V) — it shouldn't</span>
+Our own validation gate flagged a healthy model as broken. With
+<code>reduction="mean"</code> PyTorch divides by <em>target</em> length while the
+path probability accumulates over <em>frames</em>, so an untrained CTC loss is
+≈ (frames/token) × ln V ≈ 41, not ln V ≈ 6.9.
+<br><span class="lesson">Lesson: know what your loss is normalised by. A
+validator that cries wolf is worse than no validator.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · held-out set shares 39/39 speakers with training</span>
+Every WER we quoted was speaker-dependent, therefore optimistic, and not
+comparable to any published number.
+<br><span class="lesson">Lesson: "held out" means held out along the axis you
+care about. For ASR that is <em>speakers</em>, not utterances.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · checkpoint averaging made the model worse</span>
+Averaging the last 5 checkpoints gave WER 0.659 against a best single of 0.612.
+The technique assumes the checkpoints orbit <em>one</em> basin; ours spanned the
+whole run (WER 0.86 → 0.61) and were in different basins.
+<br><span class="lesson">Lesson: every technique has a precondition. Now we
+average the best-K by held-out WER, and keep it only if it wins.</span>
+</div>
+
+<h3>Theme 2 — it failed silently</h3>
+
+<div class="fail">
+<span class="what">Failure · CTC blank collapse</span>
+The model learned that emitting blank on <em>every</em> frame is a safe,
+finite-loss answer. 100% of frames blank, entropy 0.82 of a possible 6.93,
+greedy decode = empty string. Invisible in the loss (flat at a plausible value)
+and invisible in WER (pinned at 1.0, indistinguishable from "early").
+<br><span class="lesson">Lesson: log a signal that is specific to the failure
+mode — blank-frame fraction — not just the loss and the headline metric.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · torch.cuda.is_available() returned True while a conv failed</span>
+Twice. Once with a CUDA-13 wheel on a CUDA-12 driver, once with cuDNN 9.20
+against a 9.10 driver. Both would have trained silently on CPU or crashed hours in.
+<br><span class="lesson">Lesson: verify a capability by <em>exercising</em> it, not
+by asking whether it exists. The bootstrap now runs a real convolution.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · tokenizer trained on the wrong corpus, then regenerated under a checkpoint</span>
+A tokenizer fitted on dev-clean (2,557 utts) was silently reused for a
+train-clean-100 run (28,500) because the only check was vocabulary size. Later a
+validation run regenerated the file in place, remapping every token id under an
+existing checkpoint — which then emitted real structure with corrupted spelling.
+<br><span class="lesson">Lesson: artefacts that must agree should carry a
+fingerprint of each other, not just a filename.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · DTLN at the wrong hop destroyed reconstruction</span>
+Reusing a 512/256 overlap-add shell for a model trained at 512/128 looked
+harmless. 19 dB SNR in, 6 dB out.
+<br><span class="lesson">Lesson: framing parameters are part of the model, not
+tuning knobs.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · <code>zero_infinity=True</code> hides infeasible samples</span>
+If a target is longer than the encoder output, CTC is impossible — and PyTorch
+substitutes a zero gradient rather than raising. Pick a bad vocabulary and you
+silently train on a fraction of your data.
+<br><span class="lesson">Lesson: read what your loss does with its edge cases.</span>
+</div>
+
+<h3>Theme 3 — measure before you change</h3>
+
+<div class="fail">
+<span class="what">Near-miss · "the vocabulary is too big" — it wasn't</span>
+The plan after the collapse was to blame vocab 1024 and restart at 256. Research
+showed ESPnet uses <strong>5,000</strong> on the same corpus for 8.4% WER. Had we
+"fixed" it that way and it happened to work, we'd have learned the wrong lesson
+permanently. The real cause was warmup: 1,500 vs the reference 15,000.
+<br><span class="lesson">Lesson: read the reference recipe <em>before</em>
+changing hyperparameters. One hour of reading beat three days of guessing.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · decode-time attention windowing (TTS)</span>
+A plausible fix for attention stalls. Measured worse — the model was trained on
+full-softmax attention and renormalising inside a window hands it context vectors
+it has never seen.
+<br><span class="lesson">Lesson: exposure-bias fixes belong in training, not
+decoding. And: measure your clever idea before keeping it.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · MPS was 13× slower than CPU</span>
+For the TTS decoder's Python-loop over timesteps, GPU dispatch overhead dominated.
+<br><span class="lesson">Lesson: accelerators help throughput, not latency of
+small sequential ops.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · "last" is not "best" — twice</span>
+The VAD's best hard-case score was 0.806 at step 2750 while the final step scored
+0.699. The TTS judge oscillated 0.96 → 0.61 with three regressions.
+<br><span class="lesson">Lesson: select checkpoints on the metric you care about,
+and expect edge-case behaviour to oscillate while the loss looks flat.</span>
+</div>
+
+<h3>Theme 4 — the operational ones</h3>
+
+<div class="fail">
+<span class="what">Failure · pkill -f matched its own command line</span>
+The kill command contained the pattern it was searching for, so it killed itself
+before killing the target. Result: two training runs shared one GPU for 40
+minutes, halving throughput (1.53 → 0.42 it/s) and interleaving two writers into
+one log file, producing a sparse file that made `tail` show stale data.
+<br><span class="lesson">Lesson: kill by PID or process group. And when two
+things write one log, you get neither.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · num_workers=0 starved the GPU</span>
+42% GPU utilisation — the accelerator idle half the time waiting for log-mels on
+the main thread.
+<br><span class="lesson">Lesson: check utilisation before concluding a model is
+slow. 6 workers took it to 96%.</span>
+</div>
+
+<div class="fail">
+<span class="what">Failure · optimised for dollars, ignored the real cost</span>
+Ran a 27-minute reproduction on a laptop to "save" four cents of GPU time, and
+cooked the machine.
+<br><span class="lesson">Lesson: cost has more than one unit.</span>
+</div>
+
+<h2><span class="num">0.6</span>Ten things that transfer to any speech project</h2>
+<ol>
+<li><strong>Build the eval set before the model.</strong> Not a benchmark — the
+specific things that break. Module 1b's hard cases (zeros, hum, babble, quiet
+speech) took ten minutes to write and decided which checkpoint shipped.</li>
+<li><strong>Log a signal specific to each failure mode.</strong> Loss and the
+headline metric are both blind to blank collapse.</li>
+<li><strong>Verify capabilities by exercising them.</strong> Not
+<code>is_available()</code>; run the actual operation.</li>
+<li><strong>Artefacts that must agree should fingerprint each other.</strong>
+Tokenizer ↔ checkpoint, manifest ↔ audio on disk.</li>
+<li><strong>Read the reference recipe first.</strong> Hyperparameter archaeology
+is cheaper than hyperparameter search.</li>
+<li><strong>p50 and p95, decomposed per stage.</strong> An aggregate latency
+number tells you nothing about what to fix.</li>
+<li><strong>Augmentation is worth more than data below ~1000 hours</strong> — but
+regularising a model that hasn't learned the task yet only lengthens its
+plateau.</li>
+<li><strong>Streaming claims need a test</strong>, and the test needs a
+counter-test that fails when the property is removed.</li>
+<li><strong>Resume must carry the optimizer and the step</strong>, not just
+weights — otherwise the "resume" is a silent quality regression.</li>
+<li><strong>An enhancement front-end can hurt a strong downstream model.</strong>
+Measured: denoising raised Whisper's CER at 0 dB. Never assume "cleaner is
+better" without measuring the consumer.</li>
+</ol>
+
+<h2><span class="num">0.7</span>Questions you can now answer</h2>
+
+<div class="q"><span class="ask">Explain CTC. Why does it need a blank symbol?</span>
+You have T audio frames and U output tokens with no alignment between them. CTC
+defines a many-to-one collapse (merge repeats, drop blanks) and sums the
+probability of <em>every</em> frame-labelling that collapses to the target, via a
+forward-backward recursion. The blank does two jobs: it lets the model emit
+"nothing" at a frame it is unsure about, and it <em>separates genuine repeats</em>
+— without a blank between them, "hello" collapses to "helo".
+</div>
+
+<div class="q"><span class="ask">CTC vs RNN-T vs attention encoder-decoder — when would you pick each?</span>
+CTC assumes conditional independence given the audio, so it has no language
+model and needs an external LM or a second head; it is the cheapest and streams
+trivially. RNN-T adds a prediction network over output history — an internal LM —
+while keeping monotonic alignment, which is why it is the production default for
+streaming. AED (Whisper) has the strongest language modelling and the best
+accuracy offline, but its attention is not monotonic, so it streams badly and
+can hallucinate. Hybrid CTC/attention takes CTC's monotonicity as a stabiliser
+and the decoder as the LM, on one encoder.
+</div>
+
+<div class="q"><span class="ask">How do you make a Conformer stream?</span>
+Two things, and both are required. Chunked attention masking, so a frame only
+attends within its chunk plus some history; and a <em>causal</em> depthwise
+convolution, left-padded only — otherwise the conv module leaks ~15 frames of
+future and the mask is a fiction. Train with the chunk size <em>resampled every
+batch</em> and one set of weights serves every latency operating point. Cost on
+our measurements: 3% relative WER for 640 ms of lookahead.
+</div>
+
+<div class="q"><span class="ask">Why does barge-in dictate the threading model?</span>
+Barge-in means detecting speech <em>while the agent is talking</em>. VAD is
+sub-millisecond so it runs inline, but ASR and TTS are hundreds of milliseconds
+of CPU. If they ran on the event loop, the WebSocket would stop draining
+microphone audio — so the agent would be deaf exactly while it speaks. They go
+in worker threads, and an interruption cancels the in-flight reply task and tells
+the client to flush its playback buffer.
+</div>
+
+<div class="q"><span class="ask">How would you detect end-of-turn?</span>
+A fixed silence timeout is the baseline everyone ships and it forces an
+unwinnable trade: 500 ms cuts people off, 900 ms feels laggy. The modern answer
+is a small audio-native model asking "does this person expect me to reply now?"
+from prosody and syntax — falling pitch and a completed clause mean go, a held
+vowel or "my number is four two…" means wait. Smart Turn v3 is ~8M parameters
+and runs in 12 ms on CPU.
+</div>
+
+<div class="q"><span class="ask">Why might a noise suppressor make ASR worse?</span>
+Because a strong ASR was trained on noisy audio and has learned to hear through
+it, while a denoiser hands it spectral artefacts it has never seen — an
+out-of-distribution input. We measured it: at 0 dB SNR the classical front-end
+raised Whisper's CER from 0.068 to 0.079, while a model trained on clean data
+preferred the denoised input. Hence: clean audio to the VAD, original audio to
+the ASR.
+</div>
+
+<div class="q"><span class="ask">What is CTC blank collapse and how do you detect it?</span>
+A degenerate local minimum where emitting blank at every frame is a safe,
+finite-loss answer. The loss goes flat at a plausible value and WER pins at 1.0,
+so neither reveals it. Detect it by logging the fraction of frames whose CTC
+argmax is blank: healthy is ~0.85–0.95 and falling, 1.000 is dead. The documented
+cause is an aggressive early learning rate, and the documented mitigation is a
+longer warmup.
+</div>
+
+<div class="q"><span class="ask">Why is learning-rate warmup necessary for attention models?</span>
+At initialisation the attention distribution is near-uniform, so gradients
+through the softmax are large and badly conditioned. A full-size step there
+lands the model in a bad basin it does not leave. Reference ASR recipes use
+15,000–35,000 warmup steps; we used 1,500 and our CTC head collapsed at
+step 1,200 — the LR reached peak at 1,500.
+</div>
+
+<div class="q"><span class="ask">How do you evaluate an ASR system properly?</span>
+WER, not CER, because CER flatters ("recogniton" is 1/10 characters but 1/1
+words). Aggregate as total errors ÷ total reference words, never the mean of
+per-utterance WERs — that weights a 2-word utterance like a 30-word one. Hold out
+by <em>speaker</em>, not by utterance. Report the operating points separately
+(greedy / rescored / streaming) because the gaps between them are the
+information. And report RTF on a named machine.
+</div>
+
+<div class="q"><span class="ask">Build or fine-tune?</span>
+Fine-tune, almost always. Whisper and Parakeet are free and trained on ~640k
+hours; you will not beat them at the general task. From-scratch pretraining is
+justified only by a specific gap — a language or channel they cover badly,
+licensing, or cost at scale. 500 hours of your own domain audio is worth more
+than 50,000 hours of audiobooks, and fine-tuning is a $100–500 job against a
+$2–10k one.
+</div>
+
+<h2><span class="num">0.8</span>If you build a voice product next — the playbook</h2>
+<div class="tablewrap">
+<table>
+<tr><th>stage</th><th>do this</th><th>why this order</th></tr>
+<tr><td>0</td><td>Ship pretrained models behind your own pipeline. Start collecting a replayable eval corpus from real traffic <em>on day one</em>.</td><td>You cannot improve what you cannot measure, and traffic data compounds.</td></tr>
+<tr><td>1</td><td>Fix turn-taking before touching model quality.</td><td>Users perceive responsiveness before accuracy. A fixed timeout is the biggest felt defect in most agents.</td></tr>
+<tr><td>2</td><td>Fine-tune ASR on your domain with channel augmentation.</td><td>Beats any general model on your traffic, for ~1% of pretraining cost.</td></tr>
+<tr><td>3</td><td>Add contextual biasing, ITN, punctuation.</td><td>Decode-side and post-processing wins that customers notice more than WER.</td></tr>
+<tr><td>4</td><td>Only now consider training something from scratch.</td><td>Ownership, not accuracy. Be honest about which you are buying.</td></tr>
+</table>
+</div>
+
+<div class="crux">
+<span class="label">The one-line version</span>
+Everyone's models are free and roughly equal. <strong>Your advantage is your
+channel, your domain vocabulary, your turn-taking, and your evaluation
+loop</strong> — none of which come from a model checkpoint.
+</div>
+
+<h2><span class="num">0.9</span>What this project does <em>not</em> establish</h2>
+<ul>
+<li><strong>That from-scratch models are competitive.</strong> They are not, and
+were never meant to be. The scratch ASR is a teaching artefact.</li>
+<li><strong>That our numbers are publication-grade.</strong> Held-out shares
+speakers with training; the honest comparison needs real <code>test-clean</code>.</li>
+<li><strong>That the pipeline is production-hardened.</strong> No AEC, no
+telephony codec path, no autoscaling, single process, no streaming ASR wrapper
+yet.</li>
+<li><strong>That any of this works on a laptop microphone.</strong> LibriSpeech
+is read audiobook speech; spontaneous speech through a laptop mic is a domain gap
+no amount of training on that corpus closes.</li>
+</ul>
+
+<h2><span class="num">0.10</span>Where to go next in this book</h2>
+<div class="tablewrap">
+<table>
+<tr><th>if you want…</th><th>read</th></tr>
+<tr><td>how the real-time loop works</td><td><a href="01-pipeline.html">1 · Pipeline</a> → <a href="05-production.html">5 · Production</a></td></tr>
+<tr><td>the models, in build order</td><td><a href="02-vad.html">2</a> → <a href="03-asr.html">3</a> → <a href="04-tts.html">4</a> → <a href="07-denoise.html">7</a></td></tr>
+<tr><td>the modern architecture and its maths</td><td><a href="10-modern-asr.html">10 · Modern ASR</a> → <a href="12-training-run.html">12 · Training</a></td></tr>
+<tr><td>what to build for a company</td><td><a href="08-sota.html">8 · State of the art</a> → <a href="09-turn-detection.html">9 · Turn detection</a></td></tr>
+<tr><td>why any specific choice was made</td><td><a href="06-decisions.html">6 · Decision log</a> — 28 numbered ADRs</td></tr>
+</table>
+</div>
+
+</main>
+<footer class="nav">
+  <a href="index.html">← Contents</a>
+  <a href="01-pipeline.html">Next: Pipeline →</a>
+</footer>
+</body>
+</html>

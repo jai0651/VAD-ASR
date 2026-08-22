@@ -3,105 +3,264 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Voice Agent From Scratch — Learning Hub</title>
+<title>A Voice Agent From Scratch — Contents</title>
 <link rel="stylesheet" href="style.css" />
+<style>
+  .part { margin: 38px 0 6px; padding: 8px 0 6px; border-bottom: 1px solid var(--line); }
+  .part .n { font-family: var(--mono); font-size: 12px; letter-spacing: .12em;
+             text-transform: uppercase; color: var(--accent-3); }
+  .part h2 { border: 0; margin: 4px 0 2px; font-size: 21px; }
+  .part p { color: var(--muted); margin: 2px 0 0; font-size: 14.5px; }
+  .ch { display: grid; grid-template-columns: 46px 1fr; gap: 14px;
+        padding: 13px 16px; margin: 8px 0; background: var(--card);
+        border: 1px solid var(--line); border-radius: 12px; }
+  .ch .num2 { font-family: var(--mono); font-size: 20px; color: var(--accent);
+              font-weight: 700; line-height: 1.2; }
+  .ch h3 { margin: 0 0 4px; font-size: 16.5px; }
+  .ch p { margin: 0; font-size: 14.5px; color: var(--muted); }
+  .ch .take { display: block; margin-top: 7px; font-size: 13.5px; color: var(--green); }
+  .ch.star { border-color: var(--accent); }
+  .path { background: var(--card-2); border: 1px solid var(--line);
+          border-radius: 12px; padding: 14px 18px; margin: 10px 0; }
+  .path b { color: var(--accent); font-family: var(--mono); font-size: 13px; }
+</style>
 </head>
 <body>
 <header class="hero">
   <h1>A Voice Agent <span>From Scratch</span></h1>
-  <p>Deep-dive documentation written alongside the code in this repo: every model,
-     every systems decision, and what production stacks do differently — recorded
-     while it was being built, including the failures.</p>
+  <p>A complete real-time voice agent — denoise, VAD, turn-taking, ASR, LLM, TTS —
+     with every model built by hand and a production engine behind the same
+     interface, so the two can be compared on the same audio. Written while it
+     was built, including every failure.</p>
 </header>
 <main>
 
-<h2><span class="num">◈</span>The one-diagram summary</h2>
-<div class="diagram">
- <span class="m">browser mic (AudioWorklet, 48 kHz float)</span>
-      │  resample to 16 kHz, int16, 32 ms frames
-      ▼  <span class="m">WebSocket binary frames</span>
- ┌─────────────────────────── server (one session) ───────────────────────────┐
- │                                                                             │
- │  <span class="a">VAD</span> ─ per-window P(speech)     <span class="m">Module 1 VADNet │ prod: Silero v5</span>          │
- │   │                                                                         │
- │  <span class="a">ENDPOINTER</span> ─ turn detection    <span class="m">hysteresis + debounce + pre-roll</span>            │
- │   │  utterance audio (one turn)                                             │
- │  <span class="b">ASR</span> ─ audio → text             <span class="m">Module 2 CTC BiGRU │ prod: faster-whisper</span>   │
- │   │  transcript                                                             │
- │  <span class="c">RESPONDER</span> ─ text → reply       <span class="m">echo (slot for an LLM)</span>                      │
- │   │  reply text, sentence by sentence                                       │
- │  <span class="c">TTS</span> ─ text → audio             <span class="m">Module 4 Tacotron-mini │ prod: Kokoro</span>       │
- │   │                                                                         │
- │  <span class="g">ORCHESTRATOR</span> ─ the state machine that wires it all + <span class="w">BARGE-IN</span>              │
- └─────────────────────────────────────────────────────────────────────────────┘
-      │  JSON events + TTS PCM
-      ▼
- <span class="m">browser playback (flushed instantly when you interrupt)</span>
+<div class="kpi">
+  <div class="box"><div class="v">7</div><div class="k">modules built</div></div>
+  <div class="box"><div class="v">13</div><div class="k">chapters</div></div>
+  <div class="box"><div class="v">28</div><div class="k">decisions recorded</div></div>
+  <div class="box"><div class="v">20+</div><div class="k">failures catalogued</div></div>
+  <div class="box"><div class="v">66</div><div class="k">tests</div></div>
 </div>
 
-<h2><span class="num">01</span>The pages</h2>
+<div class="diagram">mic ─▶ <span class="a">DENOISE</span> ─▶ <span class="a">VAD</span> ─▶ <span class="w">ENDPOINT</span> ─▶ <span class="b">ASR</span> ─▶ <span class="c">LLM</span> ─▶ <span class="g">TTS</span> ─▶ speaker
+        <span class="m">Mod 5</span>      <span class="m">Mod 1</span>    <span class="m">Mod 3</span>        <span class="m">Mod 2/6</span>          <span class="m">Mod 4/7</span>
+        <span class="m">─────────────── all wrapped by the ORCHESTRATOR ───────────────</span>
+        <span class="m">          state machine · barge-in · latency budget</span></div>
 
-<div class="card">
-  <h3><a href="01-pipeline.html">1 · Pipeline architecture</a></h3>
-  <p>The real-time voice loop end to end: the wire protocol, the session state
-  machine, why barge-in dictates the entire threading model, latency budgets,
-  and the orchestration layer nobody's papers talk about.</p>
+<h2><span class="num">◈</span>How to read this</h2>
+<div class="path">
+  <b>30 minutes — "explain the project to me"</b><br>
+  <a href="00-crux.html">0 · The Crux</a> alone. Mind maps, the one idea per module,
+  the failure catalogue, and ten interview questions with grounded answers.
 </div>
-<div class="card">
-  <h3><a href="02-vad.html">2 · VAD deep dive</a></h3>
-  <p>Voice activity detection from your 55k-param conv net to Silero v5. Why VAD
-  and endpointing are different problems, hysteresis, pre-roll, and a real
-  domain-mismatch bug we hit (digital zeros vs. mic noise).</p>
+<div class="path">
+  <b>An afternoon — the whole build, in order</b><br>
+  <a href="00-crux.html">0</a> → <a href="01-pipeline.html">1</a> →
+  <a href="02-vad.html">2</a> → <a href="03-asr.html">3</a> →
+  <a href="04-tts.html">4</a> → <a href="07-denoise.html">7</a> →
+  <a href="05-production.html">5</a>, then <a href="06-decisions.html">6</a> for the reasoning.
 </div>
-<div class="card">
-  <h3><a href="03-asr.html">3 · ASR deep dive</a></h3>
-  <p>From your CTC BiGRU to Whisper: the alignment problem, CTC's blank trick,
-  prefix beam search, encoder-decoder ASR, streaming (RNN-T) vs utterance-based
-  recognition, and why inference engines (CTranslate2) exist.</p>
+<div class="path">
+  <b>You care about the modern model and its maths</b><br>
+  <a href="10-modern-asr.html">10 · Modern ASR</a> →
+  <a href="12-training-run.html">12 · What we are training, exactly</a> →
+  <a href="11-vocoder.html">11 · Vocoder</a>
 </div>
-<div class="card">
-  <h3><a href="04-tts.html">4 · TTS deep dive</a></h3>
-  <p>Speech synthesis as ASR's mirror: Tacotron-style attention, the guided
-  attention fix that made our model align, stop tokens, Griffin-Lim phase
-  recovery by hand, and the neural-vocoder revolution up to Kokoro/VITS.</p>
-</div>
-<div class="card">
-  <h3><a href="05-production.html">5 · Production inference</a></h3>
-  <p>What turns models into a service: model loading and sharing, quantization,
-  the event-loop rule, p50/p95 latency, health checks, scaling out, telephony
-  realities (8 kHz, AEC), and what this repo deliberately simplifies.</p>
-</div>
-<div class="card">
-  <h3><a href="06-decisions.html">6 · Decision log (ADRs)</a></h3>
-  <p>Every significant choice made while building this, with the alternatives
-  considered, the reasoning, and measured evidence — including the failures
-  (MPS 13× slower than CPU here, attention collapse before guided attention).</p>
+<div class="path">
+  <b>You are deciding what to build at work</b><br>
+  <a href="08-sota.html">8 · State of the art</a> →
+  <a href="09-turn-detection.html">9 · Turn detection</a> →
+  <a href="00-crux.html">0.8 · The playbook</a>
 </div>
 
-<h2><span class="num">02</span>How to use this repo to learn</h2>
-<ol>
-  <li><strong>Run modules 0–2</strong> (features, VAD, ASR) — each script prints/plots
-      what it learned. Read the source next to its output; every file's docstring
-      is a mini-lecture.</li>
-  <li><strong>Hear Module 4</strong>: <code>scripts/07_vocoder_roundtrip.py</code> (what mels throw away),
-      then <code>scripts/08_train_tts.py</code> and listen to <code>outputs/08_sample_step*.wav</code>
-      go from noise → mumble → speech while <code>08_alignment.png</code> forms a diagonal.</li>
-  <li><strong>Run the agent</strong>: <code>uv run python -m server.app</code>, open
-      <code>http://127.0.0.1:8000</code>, talk, interrupt it mid-reply.</li>
-  <li><strong>A/B yourself vs production</strong>: same mic audio, swap one engine at a time —
-      <code>VOICE_ASR_ENGINE=whisper</code>, then compare <code>/metrics</code> and transcript quality.
-      The gap you hear <em>is</em> the content of pages 2–4.</li>
-</ol>
+<div class="part">
+  <span class="n">Part 0</span>
+  <h2>Synthesis</h2>
+  <p>The distilled version. Written last, best read first.</p>
+</div>
+
+<div class="ch star">
+  <div class="num2">0</div>
+  <div>
+    <h3><a href="00-crux.html">The Crux</a></h3>
+    <p>Mind maps of the stack and of the model. One idea and one number per module.
+    The full failure catalogue grouped by lesson. Ten things that transfer to any
+    speech project. Interview questions with answers grounded in what we measured.
+    The playbook for building a voice product.</p>
+    <span class="take">Take-away: the most valuable output of this project is the list of specific, measured mistakes.</span>
+  </div>
+</div>
+
+<div class="part">
+  <span class="n">Part 1</span>
+  <h2>The Real-Time Loop</h2>
+  <p>The systems layer. No papers describe this, and it is what makes it a product.</p>
+</div>
+
+<div class="ch">
+  <div class="num2">1</div>
+  <div>
+    <h3><a href="01-pipeline.html">Pipeline architecture</a></h3>
+    <p>The wire protocol, the session state machine, why barge-in dictates the
+    entire threading model, latency budgets, and what is shared versus per-session.</p>
+    <span class="take">Take-away: if ASR runs on the event loop, the agent cannot hear you while it talks.</span>
+  </div>
+</div>
+
+<div class="ch">
+  <div class="num2">5</div>
+  <div>
+    <h3><a href="05-production.html">Production inference</a></h3>
+    <p>Model loading and sharing, quantization, the event-loop rule, p50/p95,
+    health checks, scaling, telephony realities, and an honest list of what this
+    repo simplifies.</p>
+    <span class="take">Take-away: percentiles, never averages — latency is long-tailed and users feel the tail.</span>
+  </div>
+</div>
+
+<div class="part">
+  <span class="n">Part 2</span>
+  <h2>The Models, In Build Order</h2>
+  <p>Each one from scratch, each with the production alternate it is measured against.</p>
+</div>
+
+<div class="ch">
+  <div class="num2">2</div>
+  <div>
+    <h3><a href="02-vad.html">Voice activity detection</a></h3>
+    <p>A 55K-parameter conv net, hysteresis, pre-roll, and the endpointing layer
+    beginners miss. Includes the live-mic bug and the retrain that fixed it.</p>
+    <span class="take">Take-away: same architecture, different data, bug fixed — for small speech models the data <em>is</em> the model.</span>
+  </div>
+</div>
+
+<div class="ch">
+  <div class="num2">3</div>
+  <div>
+    <h3><a href="03-asr.html">Speech recognition (CTC)</a></h3>
+    <p>The alignment problem, CTC's blank trick, prefix beam search, encoder-decoder
+    ASR, streaming versus utterance-based, and why inference engines exist.</p>
+    <span class="take">Take-away: CTC's conditional independence is exactly why it produces "mianthes".</span>
+  </div>
+</div>
+
+<div class="ch">
+  <div class="num2">4</div>
+  <div>
+    <h3><a href="04-tts.html">Speech synthesis</a></h3>
+    <p>ASR mirrored: attention must <em>decide</em> durations. Guided attention,
+    stop tokens, Griffin-Lim phase recovery, and the modern lineage to Kokoro.</p>
+    <span class="take">Take-away: a decode-time fix for an exposure-bias problem measured worse — the honest fix lives in training.</span>
+  </div>
+</div>
+
+<div class="ch">
+  <div class="num2">7</div>
+  <div>
+    <h3><a href="07-denoise.html">Noise suppression</a></h3>
+    <p>A streaming denoiser written by hand from MCRA + decision-directed SNR +
+    log-MMSE/OM-LSA, the two bugs that cost 5 dB of speech, and the measurement.</p>
+    <span class="take">Take-away: denoising helps the VAD at every SNR and <em>hurts</em> Whisper at 0 dB.</span>
+  </div>
+</div>
+
+<div class="part">
+  <span class="n">Part 3</span>
+  <h2>Bringing It To The State Of The Art</h2>
+  <p>Replacing the 2015 designs with the 2026 ones, so the remaining gap is data.</p>
+</div>
+
+<div class="ch">
+  <div class="num2">10</div>
+  <div>
+    <h3><a href="10-modern-asr.html">The modern recognizer</a></h3>
+    <p>Conformer with relative-position attention, BPE subwords, hybrid
+    CTC/attention, streaming by dynamic chunk masking, and the full training recipe.</p>
+    <span class="take">Take-away: the architecture halved the error on identical data, ran 2.7× faster, and added streaming for 3%.</span>
+  </div>
+</div>
+
+<div class="ch star">
+  <div class="num2">12</div>
+  <div>
+    <h3><a href="12-training-run.html">What we are training, exactly</a></h3>
+    <p>The full mathematics of the architecture and both loss terms — front end,
+    subsampling, the macaron block, relative-position attention, the chunk mask,
+    the CTC forward recursion, label-smoothed cross-entropy — each with
+    <em>why that step is there and what breaks without it</em>. Every tensor shape
+    and parameter count measured from the code.</p>
+    <span class="take">Take-away: warmup is not decoration — 1,500 versus the reference 15,000 is what collapsed the model.</span>
+  </div>
+</div>
+
+<div class="ch">
+  <div class="num2">11</div>
+  <div>
+    <h3><a href="11-vocoder.html">The neural vocoder</a></h3>
+    <p>Predicting phase instead of iterating toward it. Vocos-style ConvNeXt plus
+    an exact inverse STFT, and the metric that was rigged in Griffin-Lim's favour.</p>
+    <span class="take">Take-away: Griffin-Lim is a ceiling no amount of data can lift, because the limit isn't in a learned component.</span>
+  </div>
+</div>
+
+<div class="part">
+  <span class="n">Part 4</span>
+  <h2>The Field, And What To Build In It</h2>
+  <p>Where the state of the art actually is, and where a small team can still win.</p>
+</div>
+
+<div class="ch">
+  <div class="num2">8</div>
+  <div>
+    <h3><a href="08-sota.html">State of the art (2026)</a></h3>
+    <p>The best open models per stage and why those architectures won. The five
+    distinct gaps to production — they are not all "data". Open-dataset training
+    recipes, and where a voice-AI company should actually invest.</p>
+    <span class="take">Take-away: it's data for VAD, architecture for TTS, and everything at once for ASR.</span>
+  </div>
+</div>
+
+<div class="ch">
+  <div class="num2">9</div>
+  <div>
+    <h3><a href="09-turn-detection.html">Beating Smart Turn on telephony</a></h3>
+    <p>A build plan for an 8 kHz-native end-of-turn detector: the documented open
+    bug proving the gap is real, the trap that would invalidate the claim, the
+    telephony augmentation pipeline, and the benchmark protocol.</p>
+    <span class="take">Take-away: the benchmark <em>is</em> the contribution — and publishing where you lose is what makes it credible.</span>
+  </div>
+</div>
+
+<div class="part">
+  <span class="n">Appendix</span>
+  <h2>Reasoning</h2>
+</div>
+
+<div class="ch">
+  <div class="num2">6</div>
+  <div>
+    <h3><a href="06-decisions.html">Decision log — 28 ADRs</a></h3>
+    <p>Every significant choice, the alternatives considered, and the measured
+    evidence — including the ones that were tried and rejected.</p>
+    <span class="take">Take-away: the rejected decisions (D11b, D20, D25) are more instructive than the accepted ones.</span>
+  </div>
+</div>
 
 <div class="callout prod">
   <span class="label">The honest answer to "is this how production looks?"</span>
-  The <em>algorithms</em> in modules 0–4 are the real ones — the same math runs inside
-  Silero, Whisper and Kokoro. What production does differently: pretrained weights from
-  enormous data (that's pages 2–4), purpose-built inference runtimes, and a lot of
-  systems engineering around turn-taking and latency (pages 1 and 5 — which this repo
-  <em>does</em> implement for real).
+  The <em>algorithms</em> are the real ones — the same maths runs inside Silero,
+  Whisper and Kokoro. What production has that this doesn't: pretrained weights
+  from enormous data, purpose-built inference runtimes, and a lot of systems
+  engineering. Two of those three are covered in Parts 1 and 4. The first is the
+  one you should buy rather than build — and <a href="00-crux.html">§0.8</a>
+  explains when that stops being true.
 </div>
 
 </main>
+<footer class="nav">
+  <a href="00-crux.html">Start: The Crux →</a>
+  <a href="01-pipeline.html">Or begin the build: Pipeline →</a>
+</footer>
 </body>
 </html>

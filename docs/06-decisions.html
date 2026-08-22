@@ -14,7 +14,7 @@
      without evidence are just opinions.</p>
 </header>
 <main>
-<div class="crumbs"><a href="index.html">← hub</a></div>
+<div class="crumbs"><a href="index.html">← contents</a> · <a href="00-crux.html">the crux</a></div>
 
 <h2><span class="num">D1</span>From-scratch models are the default; production engines are config-switchable</h2>
 <div class="card">
@@ -253,10 +253,117 @@ files), and the policy layers covered by fast hermetic tests. Minimal, but it's 
 skeleton production code hangs on.</p>
 </div>
 
+<h2><span class="num">D17</span>Noise suppression: classical OM-LSA from scratch, neural engines as alternates</h2>
+<div class="card">
+<p><strong>Alternatives:</strong> train a small neural denoiser (the real SOTA path, but
+weeks and a dataset); ship GTCRN only (fast, but nothing learned).</p>
+<p><strong>Why:</strong> this is the one stage where the hand-written algorithm is still
+competitive — measured on stationary noise it edges GTCRN on ΔSNR (+5.3 vs +4.9 dB) and
+damages speech less (0.9 vs 2.0 dB), at 1/8 the CPU. So the from-scratch default is not a
+teaching compromise here, it's a defensible engineering choice, with GTCRN/DTLN one env var
+away for the non-stationary noise the statistics can't model. See
+<a href="07-denoise.html">§7</a>.</p>
+</div>
+
+<h2><span class="num">D18</span>Denoised audio goes to the VAD only, not the ASR</h2>
+<div class="card">
+<p><strong>Alternatives:</strong> clean everything (the obvious default, and what most
+stacks do); clean nothing.</p>
+<p><strong>Why:</strong> measured, not assumed. <code>scripts/10_denoise_bench.py</code>: the
+VAD improves with every engine at every SNR (room noise P 0.054 → 0.040, babble 0.51 → 0.43,
+hum 0.010 → 0.005, speech unchanged at ~0.89). Whisper's CER on 24 utterances at 0 dB SNR
+goes the wrong way — 0.068 raw → 0.079 with the spectral front-end, 0.070 with GTCRN.
+A model trained on 680k hours of noisy audio does not want your enhancement artifacts.
+Take the certain win, skip the uncertain loss; <code>VOICE_DENOISE_TARGET=both</code> flips it
+back for the scratch ASR, which does prefer clean input.</p>
+</div>
+
+<h2><span class="num">D19</span>Attach the denoiser to the VAD engine, not as a fourth orchestrator slot</h2>
+<div class="card">
+<p><strong>Alternatives:</strong> a separate stage in <code>VoiceSession.feed</code>
+(architecturally tidier).</p>
+<p><strong>Why:</strong> the endpointer buffers exactly the sample arrays the VAD returns, so
+wrapping the VAD is the only place where one object can control both <em>what gets scored</em>
+and <em>what gets transcribed</em> — which is what makes D18 implementable at all. The cost is
+a raw FIFO pre-filled with the engine's algorithmic delay; a test asserts that delay against an
+impulse, because a silent 16 ms drift there clips word onsets.</p>
+</div>
+
+<h2><span class="num">D20</span>DTLN runs at hop 128, not 256</h2>
+<div class="card">
+<p><strong>Why it's here:</strong> a bug worth remembering. Reusing the GTCRN overlap-add
+shell for DTLN looked harmless and silently destroyed reconstruction — 19 dB SNR in, 6 dB out.
+DTLN is trained for rectangular 512/128 framing (75% overlap) with the network itself learning
+to emit frames that overlap-add correctly. <strong>The hop is part of the model, not a tuning
+knob</strong>, and its algorithmic delay is therefore 384 samples, not one hop.</p>
+</div>
+
+<h2><span class="num">D21</span>Keep Module 2's CTC BiGRU; add the Conformer as a separate engine</h2>
+<div class="card">
+<p><strong>Alternatives:</strong> replace <code>src/asr/model.py</code> in place (tidier
+repo, one ASR).</p>
+<p><strong>Why:</strong> the two models exist to be compared. Module 2 <em>is</em> the
+lesson about what CTC alone can and cannot do, and deleting it deletes the evidence —
+you can no longer run "he inl san er mianthes" next to the Conformer's output on the same
+audio. Both sit behind the same engine interface, so
+<code>VOICE_ASR_ENGINE=scratch|conformer|whisper</code> A/Bs all three on one mic stream.</p>
+</div>
+
+<h2><span class="num">D22</span>Hybrid CTC/attention, not pure CTC and not a transducer</h2>
+<div class="card">
+<p><strong>Alternatives:</strong> pure CTC (what Module 2 does); RNN-T / TDT (what
+Parakeet does, and the true streaming state of the art).</p>
+<p><strong>Why:</strong> CTC's conditional independence is exactly the defect we set out to
+fix, so pure CTC was out. A transducer needs a lattice forward-backward we'd have to write
+and debug, and it buys throughput more than accuracy. Hybrid gets the missing language
+model, keeps CTC's monotonic alignment as a stabiliser, and — via attention rescoring —
+gives a cheap second opinion at decode time for one encoder's worth of compute. The
+transducer is written down as a known gap in <a href="10-modern-asr.html">§10.8</a>
+rather than pretended away.</p>
+</div>
+
+<h2><span class="num">D23</span>Dynamic chunk masking instead of two models</h2>
+<div class="card">
+<p><strong>Alternatives:</strong> train an offline model and a separate causal one;
+ship offline only (what Whisper does).</p>
+<p><strong>Why:</strong> a voice agent needs streaming, but the honest offline number is
+what you compare against. Resampling the chunk size every batch gives one set of weights
+that runs at any operating point, chosen at inference by
+<code>VOICE_CONFORMER_CHUNK</code>. The cost is a mandatory causal depthwise conv — and a
+test that <em>proves</em> causality by re-encoding a prefix and asserting the outputs are
+bit-identical, plus a second test asserting that check fails with a symmetric kernel.</p>
+</div>
+
+<h2><span class="num">D24</span>Route the CTC loss through the CPU on Apple Silicon, explicitly</h2>
+<div class="card">
+<p><strong>Alternatives:</strong> <code>PYTORCH_ENABLE_MPS_FALLBACK=1</code>; train on CPU.</p>
+<p><strong>Why:</strong> <code>aten::_ctc_loss</code> has no MPS kernel. The env var
+silently relocates <em>any</em> missing op, which turns a slowdown you understand into one
+you don't. We move this one op and verified gradients match CPU to three digits at every
+depth — which also cleared it as the suspect when CTC appeared to stall (D25).</p>
+</div>
+
+<h2><span class="num">D25</span>Warm up the augmentation, and overfit 60 utterances before every long run</h2>
+<div class="card">
+<p><strong>The failure:</strong> first real run, CTC loss fell 16.8 → 5.5 in fifty steps and
+then sat at ~5.0 for 750 more. With a 256-token vocab, ln(256) = 5.55 — the model had
+learned essentially nothing, while the attention loss fell steadily (it was learning
+unigram text statistics, which need no audio).</p>
+<p><strong>The diagnosis:</strong> not a bug. On 60 utterances with augmentation off, CTC
+goes 5.05 → 0.13 by step 400 and transcribes perfectly; with SpecAugment from step 0 it
+only reaches 1.06. <strong>CTC has a characteristic plateau</strong> — it sits near uniform
+while hunting for any alignment, then falls off a cliff — and regularising a model that
+hasn't learned the task yet just makes the plateau longer.</p>
+<p><strong>What changed:</strong> <code>AUG_START</code> delays SpecAugment and noise until
+the alignment forms, and the 4-minute overfit-60 check became the thing to run before
+committing to a long job. Same lesson as D11b and Module 1b's checkpoint selection: measure
+the specific failure before changing the model.</p>
+</div>
+
 </main>
 <footer class="nav">
-  <a href="05-production.html">← Production</a>
-  <a href="index.html">Hub ↺</a>
+  <a href="09-turn-detection.html">← Turn detection</a>
+  <a href="index.html">Back to contents →</a>
 </footer>
 </body>
 </html>

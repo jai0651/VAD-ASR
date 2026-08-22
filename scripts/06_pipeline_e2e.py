@@ -46,7 +46,8 @@ def reference_text(utt_id: str) -> str:
 
 def main() -> None:
     cfg = PipelineConfig()
-    print(f"engines: vad={cfg.vad_engine} asr={cfg.asr_engine} tts={cfg.tts_engine}")
+    print(f"engines: denoise={cfg.denoise_engine}({cfg.denoise_target}) "
+          f"vad={cfg.vad_engine} asr={cfg.asr_engine} tts={cfg.tts_engine}")
     print("[1/4] loading models...")
     vad = make_vad(cfg)
     asr = make_asr(cfg)

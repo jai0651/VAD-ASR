@@ -138,6 +138,75 @@ class ScratchASR:
         )
 
 
+class ConformerASR:
+    """Module 6: your Conformer hybrid CTC/attention recognizer.
+
+    Same interface as ScratchASR, but two things are genuinely different:
+
+      IT CAN STREAM. Trained with dynamic chunk masking, so `chunk_size` picks
+      a point on the latency/accuracy curve at inference with no retraining.
+      0 = offline (full context, best WER); 16 = 640 ms of lookahead.
+      Module 2's BiGRU could not do this at any setting — bidirectional means
+      the first frame's output depends on the last frame's input.
+
+      IT RESCORES. CTC prefix beam proposes n-best, the attention decoder picks
+      among them in one batched forward. That second opinion is the part CTC
+      structurally cannot provide itself (docs/10-modern-asr.html).
+    """
+
+    def __init__(self, cfg: PipelineConfig, beam_size: int = 8):
+        from src.asr.hybrid import HybridCTCAttention
+        from src.asr.tokenizer import BPETokenizer
+
+        ckpt = _require(
+            cfg.conformer_ckpt, "uv run python scripts/11_train_asr_conformer.py"
+        )
+        state = torch.load(ckpt, map_location="cpu")
+        self.model = HybridCTCAttention.from_state_dict(state)
+        tok_path = cfg.conformer_tokenizer or state.get("tokenizer", "")
+        self.tokenizer = BPETokenizer.load(_require(
+            tok_path, "uv run python scripts/11_train_asr_conformer.py"
+        ))
+        # Refuse a tokenizer that isn't the one this checkpoint was trained
+        # with. Token ids are meaningless across BPE fits, and the failure is
+        # silent: the model still emits fluent-looking text, just misspelled.
+        want = state.get("tokenizer_corpus", "")
+        if want and self.tokenizer.corpus != want:
+            raise RuntimeError(
+                f"tokenizer mismatch for {ckpt}: checkpoint was trained with "
+                f"corpus {want!r} but {tok_path} is {self.tokenizer.corpus!r}. "
+                f"The ids do not line up — retrain, or restore the original "
+                f"tokenizer file."
+            )
+        self.cfg = cfg
+        self.beam_size = beam_size
+        self.chunk_size = cfg.conformer_chunk
+        self._logmel = None
+        print(f"[asr] conformer checkpoint: {ckpt} "
+              f"({self.tokenizer.vocab_size} subwords, "
+              f"{'offline' if not self.chunk_size else f'{self.chunk_size*40} ms chunks'})")
+
+    @torch.no_grad()
+    def transcribe(self, audio: np.ndarray) -> Transcript:
+        from src.asr.corpus import LogMel, cmvn
+
+        if self._logmel is None:
+            self._logmel = LogMel()          # builds the filterbank once
+        t0 = time.perf_counter()
+        feats = cmvn(self._logmel(torch.from_numpy(np.ascontiguousarray(audio))))
+        lens = torch.tensor([feats.shape[0]])
+        hyp = self.model.recognize(
+            feats.unsqueeze(0), lens, beam_size=self.beam_size,
+            chunk_size=self.chunk_size,
+        )[0]
+        return Transcript(
+            text=self.tokenizer.decode(hyp).strip(),
+            language="en",
+            audio_s=audio.shape[0] / self.cfg.sample_rate,
+            latency_ms=(time.perf_counter() - t0) * 1000.0,
+        )
+
+
 class ScratchTTS:
     """Your Module 4 Tacotron-mini (text -> mel) + Griffin-Lim (mel -> audio)."""
 

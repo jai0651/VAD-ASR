@@ -96,8 +96,9 @@ class VoiceSession:
             "type": "ready",
             "input": {"sample_rate": self.cfg.sample_rate, "format": "pcm16"},
             "engines": {
-                "vad": self.cfg.vad_engine, "asr": self.cfg.asr_engine,
-                "tts": self.cfg.tts_engine, "responder": self.cfg.responder,
+                "denoise": self.cfg.denoise_engine, "vad": self.cfg.vad_engine,
+                "asr": self.cfg.asr_engine, "tts": self.cfg.tts_engine,
+                "responder": self.cfg.responder,
             },
         })
 
@@ -112,10 +113,18 @@ class VoiceSession:
             now = time.perf_counter()
             if now - self._last_vad_emit > 0.5:
                 self._last_vad_emit = now
-                await self.emit_json({
+                event = {
                     "type": "vad",
                     "prob": round(sum(self._probs) / len(self._probs), 2),
-                })
+                }
+                # Noise-suppression telemetry, when a denoiser is attached.
+                # Watch it next to P(speech): a few dB while you talk and a lot
+                # while you don't is healthy; a lot while you talk means the
+                # suppressor is eating speech (lower VOICE_DENOISE_ATTEN_DB).
+                nr = getattr(self.vad, "reduction_db", None)
+                if nr is not None:
+                    event["nr_db"] = round(nr, 1)
+                await self.emit_json(event)
                 self._probs.clear()
 
             endpoint = self.endpointer.update(res.samples, res.prob)

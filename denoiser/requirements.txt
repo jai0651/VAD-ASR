@@ -1,0 +1,21 @@
+# Realtime voice-call denoiser — pinned to versions verified on macOS
+# (Apple Silicon) with Python 3.13. NOTE: torch has no wheels for Python 3.14
+# yet, so use a 3.13 venv (see README).
+torch==2.13.0
+torchaudio==2.11.0
+deepfilternet==0.5.6      # provides the `df` package + DeepFilterNet3 model
+sounddevice==0.5.5        # PortAudio bindings (wheel bundles PortAudio)
+soundfile==0.14.0         # WAV I/O (wheel bundles libsndfile)
+onnxruntime==1.27.0       # runs the DTLN low-CPU streaming backend
+numpy==1.26.4
+
+# Streaming-engine ONNX models are NOT on PyPI — fetch them once with:
+#   ./scripts/fetch_models.sh
+
+# --- evaluation extras (only needed to run evaluate.py) ---
+# NOTE: keep numpy <2 (deepfilternet + the torch build require it); scipy 1.14.1
+# is the version that supports both Python 3.13 and numpy 1.26.
+pyarrow==25.0.0           # read the VoiceBank-DEMAND parquet
+pesq==0.0.4               # PESQ perceptual quality metric
+pystoi==0.4.1             # STOI intelligibility metric
+scipy==1.14.1             # resampling + pystoi dependency

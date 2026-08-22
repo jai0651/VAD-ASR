@@ -14,43 +14,183 @@
      Code: <code>src/asr/</code>, <code>src/pipeline/asr.py</code>.</p>
 </header>
 <main>
-<div class="crumbs"><a href="index.html">← hub</a> · <a href="02-vad.html">vad</a></div>
+<div class="crumbs"><a href="index.html">← contents</a> · <a href="00-crux.html">the crux</a> · <a href="02-vad.html">vad</a></div>
 
-<h2><span class="num">3.1</span>The alignment problem is the whole subject</h2>
-<p>An utterance is ~400 feature frames; its transcript is ~40 characters. Training data
-gives you the pair, never the mapping — nobody labels "frames 51–63 are the letter <em>c</em>".
-Every ASR architecture is fundamentally a different answer to <strong>where does the
-alignment come from?</strong></p>
+<h2><span class="num">3.1</span>The problem, before any solution</h2>
+<p>Here is the situation, and it is worth sitting with for a moment before
+reading on.</p>
+
+<p>Someone says <em>"cat"</em>. You compute features and get <strong>400
+frames</strong>. Your transcript is <strong>3 characters</strong>. Your training
+data contains exactly these two things — the audio and the string — and nothing
+else. Nobody has told you that frames 51–63 are the <em>c</em>.</p>
+
+<div class="diagram">frames:   1   2   3   4   5   6  ...  398  399  400
+          ?   ?   ?   ?   ?   ?        ?    ?    ?
+
+target:   c        a        t
+          <span class="m">↑ which frames? nobody knows, and nobody will tell you</span></div>
+
+<p>So: how do you compute a loss? A neural network needs to be told what the
+right answer is <em>at each output position</em>. You have 400 output positions
+and 3 labels.</p>
+
+<h3>Two obvious ideas, and why both fail</h3>
+<p><strong>"Just spread them evenly."</strong> Assign frames 1–133 to
+<em>c</em>, 134–266 to <em>a</em>, 267–400 to <em>t</em>. This is wrong and
+confidently so: the <em>t</em> in "cat" is a 20 ms burst, the <em>a</em> might
+run 200 ms. You would be training the model to call silence "a". Worse, the
+error is different for every utterance, so it never averages out.</p>
+
+<p><strong>"Label the data properly, then."</strong> This is what speech
+recognition actually did for thirty years — a forced aligner, built from a
+pronunciation dictionary and an HMM, produced frame labels and you trained on
+those. It works, and it means you need a lexicon for every word, a phoneme set,
+and a separate alignment model that itself has to be trained. That is the entire
+pre-2015 pipeline you are trying not to build.</p>
+
+<div class="crux-q">
+<strong>The question the whole field is organised around:</strong> can you train
+on the (audio, text) pair directly — never producing an alignment at all?
+</div>
+
+<h3>The idea: don't choose an alignment. Use all of them.</h3>
+<p>Here is the move. Instead of picking one alignment and hoping it is right,
+<strong>let the model emit one symbol per frame</strong>, and define a rule that
+squashes any such 400-symbol string down to text. Then say: the probability of
+"cat" is the probability of <em>every</em> 400-symbol string that squashes to
+"cat", added up.</p>
+
+<p>The model is never told where the <em>c</em> is. It is only told that whatever
+it emitted had better collapse to "cat". It discovers the alignment itself, as a
+side effect of maximising that sum.</p>
+
+<p>That is CTC, and everything else is detail.</p>
+
+<h2><span class="num">3.2</span>CTC, built up one piece at a time</h2>
+
+<h3>Piece 1 — the collapse rule, and the problem it creates</h3>
+<p>Start with the obvious rule: <strong>merge adjacent repeats</strong>. The
+model emits 400 symbols; identical neighbours are the same sound held longer.</p>
+<pre><code>c c c a a a a a t t   →   c a t     ✓</code></pre>
+<p>Now try it on a word with a genuine double letter. Say <em>"hello"</em>. The
+model wants to emit two <em>l</em>s. But adjacent identical symbols get
+merged — so there is <strong>no 400-symbol string that collapses to "hello"</strong>.
+Every attempt gives "helo":</p>
+<pre><code>h h e e l l l l o o   →   h e l o    ✗  the double l is gone</code></pre>
+
+<h3>Piece 2 — the blank, which exists to solve exactly that</h3>
+<p>Add one extra symbol to the vocabulary: <strong>blank</strong>, written
+<code>–</code>. Two rules now, in order: <em>merge repeats, then delete
+blanks.</em></p>
+<pre><code>h h e – l l – l o o   →   h e – l – l o   →   h e l l o    ✓</code></pre>
+<p>The blank between the two <em>l</em>s survives the merge step and breaks them
+apart; it is then deleted. That is the blank's <strong>first</strong> job, and
+it is the one people forget: <em>a blank is not silence, it is a separator</em>.</p>
+
+<p>Its second job is more obvious once you see it. The model has 400 frames and
+only 3 things to say. Most frames it has nothing new to contribute — it is
+mid-vowel, or in a pause, or unsure. The blank lets it say <strong>"nothing new
+this frame"</strong> without being wrong.</p>
+
+<div class="callout">
+<span class="label">Check your understanding</span>
+Which of these collapse to <code>"too"</code>?
+<code>t t – o o o</code> · <code>t – o – o</code> · <code>t t o o o</code>
+<br><em>Answers: the first gives "to" (the two o's merge — wrong), the second
+gives "too" ✓, the third gives "to" (wrong). Only an explicit blank between the
+o's produces the double.</em>
+</div>
+
+<h3>Piece 3 — the loss: adding up a number you cannot enumerate</h3>
+<p>Now the sum. Many 400-symbol strings collapse to "cat", and the loss is the
+negative log of their total probability:</p>
+<pre><code>L = −log [ P(c c c a a a a a t t) + P(– c – a a a t t –) + P(c – – a a t t t t) + … ]</code></pre>
+<p>How many terms is that? For 400 frames over a 29-symbol vocabulary, the number
+of valid alignments is astronomically large — you could not write them down, let
+alone add them up.</p>
+
+<p>The escape is that you don't have to. <strong>Alignments share prefixes.</strong>
+Every path that has emitted "c a" by frame 200 is, from frame 201 onward,
+facing exactly the same remaining problem — it does not matter <em>how</em> it
+got there. So you never track individual paths; you track <em>how much total
+probability has reached each (frame, position-in-target) cell</em>, and sweep
+forward one frame at a time.</p>
+
+<div class="diagram">        frame → 1     2     3     4     5   ...
+target
+   –           α ─── α ─── α ─── α ─── α        <span class="m">every arrow: stay, or advance</span>
+   c            ╲    │╲    │╲    │╲    │        <span class="m">the value in each cell is the TOTAL</span>
+   –             ╲   │ ╲   │ ╲   │ ╲   │        <span class="m">probability of all paths reaching it</span>
+   a              ╲  │  ╲  │  ╲  │  ╲  │
+   –                 ↓     ↓     ↓     ↓        <span class="m">400 columns, ~7 rows — trivial to compute</span>
+   t
+   –                            <span class="a">answer = last two cells of the final column</span></div>
+
+<p>That is the forward algorithm, and it turns an astronomically large sum into a
+grid you sweep once. It is the same trick as any dynamic program: exponentially
+many paths, polynomially many <em>states</em> those paths can be in.</p>
+
+<p>In our code this is one line — <code>torch.nn.CTCLoss</code> — and the reason
+it is worth understanding anyway is that its edge cases bite. If the target is
+longer than the number of frames there is no valid path at all, and PyTorch
+silently returns a zero gradient rather than an error
+(<a href="12-training-run.html">§12.4</a>).</p>
+
+<h3>Piece 4 — decoding, where the same sum reappears</h3>
+<p>At inference you want the most likely <em>text</em>, but the model gives you
+per-frame symbol probabilities. The cheap answer, <strong>greedy decoding</strong>,
+takes the argmax at each frame and collapses it. That commits to one alignment —
+and the most likely alignment is not necessarily the most likely text, because
+the text's probability is spread across many alignments.</p>
+
+<p><strong>Prefix beam search</strong> fixes this by scoring text prefixes rather
+than paths, keeping the top-k. Its one subtlety is the one you would predict from
+Piece 2: each prefix must track <em>two</em> probabilities — the probability it
+ends in a blank, and the probability it ends in a real symbol. Without that
+split you cannot tell "the model repeated the o" from "the model wrote a second
+o", which is the "too" versus "to" question again.</p>
+
+<div class="crux-q">
+<strong>Where this leaves us.</strong> We can now train on (audio, text) pairs
+with no aligner, no lexicon, and no phoneme set. That is a genuinely large win.
+What we have <em>not</em> got is any notion of what English looks like.
+</div>
+
+<h3>The flaw that defines everything after CTC</h3>
+<p>Look again at how the loss factorises: the model emits each frame's symbol
+<strong>independently</strong>, given the audio. Frame 200 does not know what
+frame 199 emitted. So nothing in the model knows that a <em>q</em> is followed by
+a <em>u</em>, or that "shold" is not a word.</p>
+
+<p>This is not a bug to be fixed with more data — it is structural, and it is
+exactly what our Module 2 output looks like:</p>
+<pre><code>hyp: he inl san er mianthes tlen kis roint the stieia sord meai wen
+ref: but in less than five minutes the staircase groaned beneath an extraordinary weight</code></pre>
+<p>Notice the <em>kind</em> of error. The rhythm is right, many vowels are right —
+it is not acoustically stupid. It is <strong>orthographically impossible</strong>.
+No English word looks like "mianthes".</p>
+
+<p>There are only two ways out, and they are the next two architectures:
+bolt a language model onto the beam search from outside, or put the language
+model <em>inside</em> the network by letting it condition on what it has already
+emitted.</p>
+
+<h3>Now the map makes sense</h3>
+<p>With the alignment problem in hand, the three families are simply three
+different answers to <em>where does the alignment come from</em>:</p>
 
 <div class="tablewrap"><table>
-<tr><th>Family</th><th>Alignment mechanism</th><th>Streaming?</th><th>Examples</th></tr>
-<tr><td><strong>CTC</strong> (yours)</td><td>emit a symbol (or blank) <em>every frame</em>; sum over all frame-strings that collapse to the target</td><td>yes (with a causal encoder)</td><td>DeepSpeech 2, wav2vec 2.0 fine-tunes</td></tr>
-<tr><td><strong>RNN-T</strong></td><td>a learned joiner decides at each frame: emit another token or consume the next frame</td><td><strong>yes — its reason to exist</strong></td><td>Google/Apple on-device dictation, Conformer-T</td></tr>
-<tr><td><strong>Attention enc-dec</strong></td><td>a text decoder <em>generates</em> tokens, softly attending over all audio frames</td><td>not naturally (wants the full utterance)</td><td><strong>Whisper</strong>, LAS</td></tr>
+<tr><th>Family</th><th>Alignment mechanism</th><th>Has a language model?</th><th>Streaming?</th><th>Examples</th></tr>
+<tr><td><strong>CTC</strong> (Module 2)</td><td>emit a symbol or blank every frame; sum over all collapsings</td><td><strong>no</strong> — the defining flaw</td><td>yes, with a causal encoder</td><td>DeepSpeech 2, wav2vec 2.0 fine-tunes</td></tr>
+<tr><td><strong>RNN-T</strong></td><td>a learned joiner decides each step: emit another token, or advance a frame</td><td>yes — a prediction network over output history</td><td><strong>yes — its reason to exist</strong></td><td>Parakeet-TDT, on-device dictation</td></tr>
+<tr><td><strong>Attention enc-dec</strong></td><td>a decoder generates tokens, softly attending over all frames</td><td>yes — the decoder <em>is</em> one</td><td>not naturally; wants the whole utterance</td><td><strong>Whisper</strong>, LAS</td></tr>
 </table></div>
 
-<h2><span class="num">3.2</span>CTC, compressed to its three ideas</h2>
-<p>(Your Modules 2/2b implement all of this by hand — <code>src/asr/text.py</code>,
-<code>model.py</code>, <code>decode.py</code>. This is the summary to hold in your head.)</p>
-<ol>
-<li><strong>The collapse rule.</strong> The model emits one symbol per frame over
-{chars + <em>blank</em>}. Decoding = merge adjacent repeats, then delete blanks:
-<code>cc–aa–t → cat</code>. The blank is what lets the model say "nothing new this frame"
-and what separates genuine doubles (<code>hel–lo</code> needs a blank between the l's).</li>
-<li><strong>The loss.</strong> Many frame-strings collapse to the same text. CTC loss =
-−log of the <em>sum</em> of their probabilities (computed by dynamic programming). The
-model is free to discover its own alignment — early in training the probability mass sits
-on "all blanks", then crisp spikes of characters emerge. </li>
-<li><strong>Decoding.</strong> Greedy (argmax per frame, then collapse) commits to one
-alignment. Prefix beam search — your <code>decode.py</code> — carries the top-k text
-prefixes, each tracking P(ends in blank) vs P(ends in symbol), summing over alignments
-properly. That blank/non-blank split is the trick to score repeated characters right.</li>
-</ol>
-<p>CTC's built-in flaw: it predicts each frame <strong>conditionally independently</strong> —
-there's no language model inside it, so it happily writes "shold" where a decoder that
-remembers its own output would write "should". Fixes: bolt an external LM onto the beam
-(production CTC systems), or move the language model inside — which is exactly the next
-two architectures.</p>
+<p>And it explains the design of <a href="10-modern-asr.html">Module 6</a>: put a
+CTC head <em>and</em> an attention decoder on one encoder, and each covers the
+other's structural weakness — CTC's monotonic alignment stops the attention
+wandering, and the decoder supplies the language model CTC cannot have.</p>
 
 <h2><span class="num">3.3</span>Whisper: what 680k hours + a decoder buys</h2>
 <div class="diagram">
@@ -148,10 +288,21 @@ modern encoder default.</li>
 attacks CTC's independence assumption.</li>
 </ol>
 
+<div class="callout prod">
+<span class="label">All of that is now built</span>
+<a href="10-modern-asr.html">Module 6</a> does exactly these things: a Conformer encoder
+with relative-position attention, BPE subwords, and an autoregressive decoder trained
+jointly with CTC — which is the principled version of "shallow LM fusion", since the
+language model is learned on the same encoder rather than bolted on at decode time. It
+also streams, which the BiGRU on this page structurally cannot. Read this page first, then
+that one: the point of keeping both models in the repo is that you can run them on the
+same audio and hear the difference.
+</div>
+
 </main>
 <footer class="nav">
   <a href="02-vad.html">← VAD</a>
-  <a href="04-tts.html">Next: TTS deep dive →</a>
+  <a href="04-tts.html">Next: TTS →</a>
 </footer>
 </body>
 </html>

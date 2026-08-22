@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>9 · Telephony Turn Detection — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header class="hero">
+  <h1>Beating Smart Turn <span>Where It's Weak</span></h1>
+  <p>A build plan for a telephony-native end-of-turn detector: why the gap is
+     real, the trap that would invalidate the whole thing, the augmentation
+     pipeline, and the benchmark that is the actual contribution.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← contents</a> · <a href="00-crux.html">the crux</a> · <a href="08-sota.html">state of the art</a></div>
+
+<h2><span class="num">9.1</span>Verdict</h2>
+<div class="callout">
+<span class="label">Do it</span>
+Of everything in <a href="08-sota.html">§8</a>, this is the one project where a
+single person with an M4 can plausibly produce a model that beats the best open
+model on a defensible benchmark. Four properties make it winnable, and all four
+have to hold — they rarely do:
+<ul>
+<li><strong>The baseline is small.</strong> Smart Turn v3 is ~8M parameters (a
+Whisper-tiny encoder plus a linear head). You are not competing with 600M.</li>
+<li><strong>The baseline is fully open.</strong> BSD-2 weights, open training
+code, open train/test datasets on HuggingFace. You can reproduce its number
+before you try to beat it — which means your claim is checkable.</li>
+<li><strong>The gap is narrow and nameable.</strong> Not "better turn detection"
+but "8 kHz μ-law, tandem-transcoded, Indian-English/Hindi code-switched".</li>
+<li><strong>It's the layer with the most product leverage and the fewest
+papers.</strong> Turn-taking is what makes an agent feel human, and this repo's
+own <code>endpointing.py</code> is still a fixed 700 ms timeout.</li>
+</ul>
+</div>
+
+<h2><span class="num">9.2</span>Is the gap real? Yes, and it's documented</h2>
+<p>Not a hunch. <a href="https://github.com/pipecat-ai/pipecat/issues/3844">Pipecat
+issue #3844</a>, filed February 2026 and still open:</p>
+<ul>
+<li><code>LocalSmartTurnAnalyzerV3</code> builds a <code>WhisperFeatureExtractor</code>
+with <code>sampling_rate=16000</code> and does <strong>no internal resampling</strong>.
+Twilio's own docs tell you to set <code>audio_in_sample_rate=8000</code>.</li>
+<li>Result: the model interprets speech at 2× speed with shifted pitch, and
+fails <em>silently</em> — no error, no warning.</li>
+<li>Measured by the reporter: <strong>6 of 20 utterances flipped</strong>
+Complete ↔ Incomplete; max probability shift 0.94; mean turn duration in
+production dropped <strong>51%</strong> (2.33 s → 1.14 s); phone numbers
+fragmented across turns because digit sequences stopped being recognised as
+incomplete.</li>
+</ul>
+<p>Phone numbers fragmenting mid-utterance is not a benchmark abstraction. That
+is a broken IVR replacement, in production, today.</p>
+
+<h2><span class="num">9.3</span>The trap that would sink the project</h2>
+<div class="callout warn">
+<span class="label">Read this before writing any code</span>
+That bug is an <strong>integration</strong> bug, not proof of a
+<strong>capability</strong> gap. Resample 8 kHz → 16 kHz before the feature
+extractor and the reported failure disappears. If your benchmark compares your
+model against <em>naively-fed-8 kHz</em> Smart Turn, you will "win" by 30 points,
+someone will point out the one-line fix, and the entire project is dismissed.
+<br><br>
+<strong>You must publish three baselines, not one:</strong>
+<ol>
+<li><em>Smart Turn, naive 8 kHz</em> — reproduces the bug. Interesting as a
+field-safety finding, worthless as a model comparison.</li>
+<li><em>Smart Turn, correctly resampled 8→16 kHz</em> — <strong>this is the real
+baseline.</strong> Every claim you make must be against this number.</li>
+<li><em>Smart Turn, original wideband audio</em> — the ceiling, showing how much
+the channel costs <em>anyone</em>.</li>
+</ol>
+The durable gap is that even correctly resampled, μ-law-quantised,
+band-limited, twice-transcoded audio is out-of-distribution for a model trained
+on clean wideband mic recordings. Upsampling does not restore the 4–8 kHz band —
+and fricatives, sibilants and the aspiration cues that mark a completed clause
+live up there. <strong>That</strong> is your thesis, and it's a defensible one.
+</div>
+
+<h2><span class="num">9.4</span>What you build</h2>
+<p>Everything here is buildable from the primitives already in this repo:
+<code>src/audio/features.py</code> is the front-end, <code>src/vad/model.py</code>
+is the conv-over-time skeleton, <code>scripts/09</code> is the
+hard-case-selection training loop.</p>
+
+<div class="diagram">8 kHz μ-law call audio
+   │  <span class="m">telephony augmentation (§9.5) — applied at TRAIN time to clean data</span>
+   ▼
+<span class="a">framing + log-mel front-end</span>          <span class="m">write it yourself first; src/audio/features.py</span>
+   │  <span class="m">64 mels, fmax 3.8 kHz (not 8 kHz — there is nothing above it)</span>
+   ▼
+<span class="a">SpecAugment</span>                         <span class="m">2 freq masks, 2 time masks</span>
+   │
+   ▼
+<span class="b">causal conv / Conformer encoder</span>       <span class="m">~4-8M params; NO look-ahead beyond the window</span>
+   │
+   ▼
+<span class="c">binary EOU head</span> + focal loss          <span class="m">"does the human expect me to reply now?"</span>
+   │
+   ▼
+<span class="g">ONNX export → int8</span>                    <span class="m">target: p95 &lt; 25 ms on one CPU core</span></div>
+
+<h3>Design choices worth defending</h3>
+<ul>
+<li><strong>8 kHz native, not upsampled.</strong> Smart Turn upsamples into a
+16 kHz model. Train at 8 kHz with <code>fmax ≈ 3.8 kHz</code> and 64 mels: you
+spend every mel bin on a band that actually carries information, instead of
+spending a third of them on the empty 4–8 kHz region. This is the clearest
+architectural reason you should win on-channel.</li>
+<li><strong>Causal.</strong> An end-of-turn detector that needs future context has
+added its look-ahead to the response latency. Causal convolutions or
+left-context-only attention.</li>
+<li><strong>Focal loss.</strong> The classes are wildly imbalanced — most frames
+are mid-utterance. γ ≈ 2 focuses the gradient on the ambiguous boundary cases,
+which is exactly where the product lives.</li>
+<li><strong>Predict at a decision rate, not once per utterance.</strong> Smart Turn
+classifies a trailing window. Emitting P(end-of-turn) every 40–80 ms lets the
+orchestrator act the instant confidence crosses a threshold, and it makes the
+model directly droppable into <code>EndpointDetector</code> in place of the
+fixed timeout.</li>
+</ul>
+
+<h2><span class="num">9.5</span>The telephony augmentation pipeline</h2>
+<p>This is the part that is genuinely yours, and it is mostly signal processing
+rather than ML. Take Smart Turn's open training set (clean, wideband) and push
+it through a real phone network in software:</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>stage</th><th>what to do</th><th>why it matters</th></tr>
+<tr><td>Band-limit + resample</td><td>16 k → 8 k with a proper anti-alias filter; also model the 300–3400 Hz passband</td><td>the fundamental information loss; everything else is on top</td></tr>
+<tr><td>G.711 μ-law round-trip</td><td>encode/decode; 8-bit logarithmic quantisation</td><td>adds quantisation noise that is <em>signal-dependent</em> — loudest where speech is loudest</td></tr>
+<tr><td>Tandem transcoding</td><td>μ-law → G.729/Opus-narrowband → μ-law</td><td>the real killer. Carrier → SIP trunk → PBX often means two or three codecs. Artefacts compound non-linearly</td></tr>
+<tr><td>Packet loss</td><td>1–8% loss, bursty (Gilbert-Elliott), with PLC-style concealment</td><td>concealed gaps look like pauses — the single most likely cause of a false "turn ended"</td></tr>
+<tr><td>Jitter buffer</td><td>variable delay, occasional frame repeat/drop</td><td>changes local timing, which is exactly what a prosody model reads</td></tr>
+<tr><td>Comfort noise / VAD-DTX</td><td>replace silence with synthetic CN at the right level</td><td>carriers do this. It means your "silence" is not silence, and a model trained on true silence is surprised</td></tr>
+<tr><td>AGC + compression</td><td>dynamic-range compression, level normalisation</td><td>flattens the falling-pitch, falling-energy cue that marks the end of a clause</td></tr>
+<tr><td>Line noise</td><td>hum, hiss, crosstalk, hold music bleed, IVR beeps, DTMF</td><td>your hard negatives; the analogue of Module 1b's noise bed</td></tr>
+</table>
+</div>
+
+<p>Two rules that decide whether this works:</p>
+<ol>
+<li><strong>Augment on the fly, per epoch, with random parameters.</strong> The
+augmentation space <em>is</em> your dataset. A pre-baked degraded copy is one
+sample from it and the model will overfit the specific artefacts.</li>
+<li><strong>Hold out augmentation configurations, not just utterances.</strong>
+Train on μ-law + G.729; test on a codec chain the model never saw. Otherwise
+you are measuring memorisation of artefacts, and real carriers will differ.</li>
+</ol>
+
+<h2><span class="num">9.6</span>Data and labels</h2>
+<ul>
+<li><strong>Base:</strong> the Smart Turn v3.x train sets on HuggingFace. Open
+licence, already labelled, and using them makes your comparison exactly
+like-for-like — same content, different channel.</li>
+<li><strong>Your moat:</strong> real call audio from tonecall, with turn
+boundaries labelled. This is the asset nobody else can download. Get the legal
+and consent position straight <em>first</em> — recording, retention and
+publication of call audio are governed by real rules, and a public benchmark
+built on uncleared call recordings is a liability, not an asset. If publishing
+audio isn't clearable, publish <strong>features and labels</strong>, or a
+synthetic re-recording that reproduces the phenomena.</li>
+<li><strong>Indic code-switching:</strong> IndicVoices (~12k h, 22 languages,
+conversational and code-switched) is the best open source. It is not
+telephony-native, so it goes through the same §9.5 pipeline. Note the honest
+limitation: Smart Turn covers Hindi and Marathi already, so your claim must be
+about <em>code-switched</em> Indian English over a phone line — a narrower and
+more truthful claim than "Indian languages".</li>
+<li><strong>Labelling policy is the hidden hard part.</strong> "End of turn" is
+not objective — a 400 ms pause before "…um, yes" is a completed turn for one
+annotator and a hesitation for another. Write the policy down, measure
+inter-annotator agreement on ~200 clips, and publish it. A benchmark whose label
+definition is unstated is not a benchmark.</li>
+</ul>
+
+<h2><span class="num">9.7</span>The benchmark <em>is</em> the contribution</h2>
+<p>The model is the artefact people will download; the benchmark is what makes
+the work citable. It doesn't exist today, which is the opportunity.</p>
+
+<h3>What to publish</h3>
+<div class="tablewrap">
+<table>
+<tr><th>condition</th><th>Smart Turn (naive 8k)</th><th>Smart Turn (resampled)</th><th>Smart Turn (wideband)</th><th>yours</th></tr>
+<tr><td>clean wideband</td><td>—</td><td>—</td><td><em>baseline ceiling</em></td><td><strong>expect to lose slightly</strong></td></tr>
+<tr><td>8 kHz μ-law</td><td>broken</td><td><em>the real baseline</em></td><td>—</td><td>expect to win</td></tr>
+<tr><td>tandem transcode</td><td>broken</td><td><em>the real baseline</em></td><td>—</td><td>expect to win more</td></tr>
+<tr><td>+ 3% packet loss</td><td>broken</td><td><em>the real baseline</em></td><td>—</td><td>expect to win most</td></tr>
+<tr><td>code-switched hi-EN calls</td><td>broken</td><td><em>the real baseline</em></td><td>—</td><td>the language claim</td></tr>
+</table>
+</div>
+
+<p><strong>Report losses honestly and prominently.</strong> "We lose 1.5 points on
+clean wideband, we win 9 points on transcoded telephony, here is why" is a far
+stronger artefact than a table where you win everywhere — which nobody believes
+anyway.</p>
+
+<h3>Metrics that reflect the product</h3>
+<ul>
+<li><strong>Not accuracy.</strong> The two errors are not symmetric: interrupting
+a user mid-sentence is much worse than a 200 ms extra wait. Report false-endpoint
+rate and missed-endpoint rate separately, and publish the full ROC — then pick an
+operating point and justify it.</li>
+<li><strong>Time-to-decision</strong>, not just correctness: how many ms after the
+true end of turn does the model fire? A model that's right 400 ms late has cost
+you the entire latency advantage.</li>
+<li><strong>p50/p95 CPU latency</strong> on a named machine, int8 and fp32,
+single-threaded. Smart Turn's 12 ms is the number to beat or match.</li>
+<li><strong>A slice for digit sequences.</strong> "My number is four two…" is the
+failure in issue #3844 and the most commercially important case in telephony.</li>
+</ul>
+
+<h2><span class="num">9.8</span>Plan</h2>
+<div class="tablewrap">
+<table>
+<tr><th>week</th><th>deliverable</th><th>the gate</th></tr>
+<tr><td>1</td><td>Reproduce Smart Turn v3.x's published number on its own test set. Build the 8 kHz front-end.</td><td>If you can't reproduce the baseline, stop — you have no comparison.</td></tr>
+<tr><td>2</td><td>Telephony augmentation pipeline + listening tests. Measure Smart Turn's degradation across all three baselines.</td><td><strong>The real gate.</strong> If correctly-resampled Smart Turn barely degrades, the project's thesis is wrong — pivot to the language axis or stop.</td></tr>
+<tr><td>3–4</td><td>Train the 8 kHz-native model. Encoder, focal loss, hard-case checkpoint selection (the <code>scripts/09</code> pattern).</td><td>Beat resampled Smart Turn on degraded audio by a margin bigger than run-to-run variance (train 3 seeds).</td></tr>
+<tr><td>5</td><td>ONNX export, int8 quantisation, latency harness. Drop it into <code>src/pipeline/endpointing.py</code> behind a config flag.</td><td>p95 &lt; 25 ms on one core, and a live call that feels better than the 700 ms timeout.</td></tr>
+<tr><td>6</td><td>Publish: weights, training code, the degraded eval set, the results table with losses included, and a writeup that leads with the #3844 finding.</td><td>Someone else can reproduce your table from your repo.</td></tr>
+</table>
+</div>
+
+<h2><span class="num">9.9</span>How this could fail</h2>
+<ul>
+<li><strong>Smart Turn is a moving target.</strong> v3.1 added real human audio,
+v3.2 added café/office noise and fixed short-utterance handling. Assume the
+clean-audio baseline improves again before you publish. Your advantage must be
+the <em>channel</em>, not general quality — and the channel is a much slower
+thing for them to fix, because it needs telephony data they don't have.</li>
+<li><strong>They ship a fix.</strong> The one-line resample fix for #3844 will
+land. Good: it removes the noise and leaves your real claim standing. Plan for
+it rather than racing it.</li>
+<li><strong>Data volume.</strong> Degraded copies of one open dataset is one
+dataset. Without real call audio the result may not transfer. Budget the legal
+and labelling work as a first-class task, not an afterthought.</li>
+<li><strong>Label noise dominates.</strong> If inter-annotator agreement on your
+eval set is 85%, a 3-point win is not a win. Measure agreement before you claim
+anything.</li>
+</ul>
+
+<h2><span class="num">9.10</span>If you want a second and third option</h2>
+<ol>
+<li><strong>8 kHz-native denoiser.</strong> Same thesis, different stage: GTCRN,
+DTLN and DeepFilterNet are all wideband. Retrain a GTCRN-class model at 8 kHz on
+telephony-degraded DNS data. Smaller upside than turn detection, but the cheapest
+to execute — 23.7K parameters, and <code>denoiser/evaluate.py</code> already
+computes PESQ/STOI/SI-SDR.</li>
+<li><strong>Code-switched Indian-English ASR.</strong> Fine-tune Parakeet or
+Whisper on IndicVoices' code-switched split pushed through §9.5's pipeline.
+Highest commercial value, lowest novelty — you'd be doing well-understood
+fine-tuning rather than producing a new artefact.</li>
+<li><strong>A telephony voice-agent benchmark suite.</strong> The union of the
+above: one replayable corpus, one harness, per-stage and end-to-end metrics.
+Least glamorous, and the thing a company in this space would most want to own.</li>
+</ol>
+
+<p>Turn detection is still the pick: it is the only one where the artefact is
+<em>a model that is state of the art at something</em>, and the benchmark is a
+by-product you'd have to build anyway.</p>
+
+</main>
+<footer class="nav">
+  <a href="08-sota.html">← State of the art</a>
+  <a href="06-decisions.html">Next: Decision log →</a>
+</footer>
+</body>
+</html>
