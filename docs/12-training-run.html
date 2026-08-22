@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>12 · What We Are Training, Exactly — Voice Agent From Scratch</title>
+<link rel="stylesheet" href="style.css" />
+<!-- Delimiters are \( \) and \[ \] ONLY: this page quotes dollar costs, and
+     enabling $...$ would turn "$1.70 ... $0.85" into a maths expression. -->
+<script>
+window.MathJax = {
+  tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] },
+  options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] },
+  chtml: { scale: 0.95 }
+};
+</script>
+<script id="MathJax-script" async
+  src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  mjx-container { color: var(--text); overflow-x: auto; overflow-y: hidden; }
+  mjx-container[display="true"] { margin: 14px 0; padding: 4px 0; }
+  .eq { background: #0e1422; border: 1px solid var(--line); border-radius: 10px;
+        padding: 4px 18px; margin: 14px 0; }
+  .eq .lbl { font-family: var(--mono); font-size: 12px; color: var(--muted);
+             letter-spacing: .06em; text-transform: uppercase; margin-top: 10px; }
+</style>
+</head>
+<body>
+<header class="hero">
+  <h1>What We Are Training, <span>Exactly</span></h1>
+  <p>Every tensor, every parameter, every term in the loss, and the methodology
+     around them — for the ASR run currently in progress. Numbers on this page
+     are measured from the code, not estimated.</p>
+</header>
+<main>
+<div class="crumbs"><a href="index.html">← contents</a> · <a href="00-crux.html">the crux</a> · <a href="10-modern-asr.html">module 6 arch</a> · <a href="08-sota.html">state of the art</a></div>
+
+<h2><span class="num">12.1</span>The one-paragraph version</h2>
+<p>We are training a <strong>28.0M-parameter Conformer speech recognizer</strong>
+on <strong>LibriSpeech train-clean-100</strong> (100 hours of read English), from
+scratch, on a rented RTX A4000. It maps a waveform to text through two heads
+trained jointly: a <strong>CTC</strong> head that learns the alignment, and an
+<strong>attention decoder</strong> that learns the language. The target is a word
+error rate in the low teens; the reference implementation of this exact recipe
+reaches 8.4%.</p>
+
+<div class="kpi">
+  <div class="box"><div class="v">28.0M</div><div class="k">parameters</div></div>
+  <div class="box"><div class="v">100 h</div><div class="k">training audio</div></div>
+  <div class="box"><div class="v">1024</div><div class="k">BPE subwords</div></div>
+  <div class="box"><div class="v">25/s</div><div class="k">encoder frame rate</div></div>
+  <div class="box"><div class="v">~10 h</div><div class="k">GPU time for a full run</div></div>
+</div>
+
+<h2><span class="num">12.2</span>The journey of one utterance</h2>
+<p>Ten seconds of speech, traced through every transformation. Shapes below are
+printed from the real model, not sketched.</p>
+
+<div class="diagram">  <span class="m">waveform, 16 kHz mono</span>                      (160000,)          float32
+      │  <span class="m">framing: 25 ms window, 10 ms hop</span>
+      ▼  <span class="m">|rFFT|², 80 triangular mel filters, log</span>
+  <span class="a">log-mel spectrogram</span>                       (998, 80)          100 frames/s
+      │  <span class="m">CMVN: subtract mean, divide by std, per utterance</span>
+      │  <span class="m">SpecAugment: mask 2 freq bands, 5 time spans</span>
+      ▼
+  <span class="a">model input</span>                               (1, 998, 80)
+      │  <span class="m">2 × Conv2d(3×3, stride 2) → ×4 downsample in time AND frequency</span>
+      ▼  <span class="m">flatten freq into channels → Linear → d_model</span>
+  <span class="b">subsampled sequence</span>                       (1, 248, 256)      25 frames/s, 40 ms each
+      │
+      │  <span class="b">12 × Conformer block</span>  <span class="m">(½FFN → self-attention → conv → ½FFN → LayerNorm)</span>
+      ▼
+  <span class="b">encoded sequence</span>                          (1, 248, 256)
+      │
+      ├─▶ <span class="c">CTC head</span>: Linear(256 → 1024)          (1, 248, 1024)     per-frame subword scores
+      │
+      └─▶ <span class="c">attention decoder</span>: 6 transformer layers, cross-attends the encoder
+                                                             emits subwords one at a time</div>
+
+<div class="callout">
+<span class="label">The number that governs everything downstream</span>
+<strong>×4 subsampling.</strong> 998 input frames become 248. Three consequences:
+self-attention is O(T²) so this is a <strong>16×</strong> reduction in attention
+cost; each output frame now represents 40 ms, which sets the finest possible
+alignment granularity; and the CTC head must fit every subword of the transcript
+into those 248 slots. That last one is a hard constraint — see §12.5.
+</div>
+
+<h2><span class="num">12.3</span>Where the 28 million parameters live</h2>
+<div class="tablewrap">
+<table>
+<tr><th>component</th><th>parameters</th><th>share</th><th>what it does</th></tr>
+<tr><td>12 × Conformer encoder block</td><td><strong>19.07 M</strong></td><td>68.1%</td><td>turns acoustics into contextual representations</td></tr>
+<tr><td>6 × Transformer decoder layer</td><td>6.32 M</td><td>22.6%</td><td>the implicit language model</td></tr>
+<tr><td>conv subsampling front-end</td><td>1.84 M</td><td>6.6%</td><td>×4 downsample + project to d_model</td></tr>
+<tr><td>CTC head (Linear 256→1024)</td><td>0.26 M</td><td>0.9%</td><td>per-frame subword scores</td></tr>
+<tr><td>decoder output projection</td><td>0.26 M</td><td>0.9%</td><td>hidden → subword logits</td></tr>
+<tr><td>decoder token embedding</td><td>0.26 M</td><td>0.9%</td><td>subword → vector</td></tr>
+</table>
+</div>
+
+<p>Inside <em>one</em> encoder block (×12 of these):</p>
+<div class="tablewrap">
+<table>
+<tr><th>sub-module</th><th>params</th><th>purpose</th></tr>
+<tr><td>FFN #1 (macaron half)</td><td>526.1 K</td><td>position-wise capacity, ½-weighted</td></tr>
+<tr><td>relative-position self-attention</td><td>329.2 K</td><td>global context; "30 ms earlier", not "frame 412"</td></tr>
+<tr><td>convolution module</td><td>206.6 K</td><td>local acoustics; depthwise kernel 31 = <strong>1.24 s</strong> of receptive field after subsampling</td></tr>
+<tr><td>FFN #2 (macaron half)</td><td>526.1 K</td><td>the other ½-weighted FFN</td></tr>
+</table>
+</div>
+
+<p>Note the split: <strong>two-thirds of the block is feed-forward</strong>, and
+attention is the smallest learned part after the conv. Conformer's contribution
+isn't "add attention" — it's putting attention and convolution side by side so
+each handles what it is good at, and spending most of the parameters on plain
+position-wise transformation.</p>
+
+<h2><span class="num">12.35</span>The architecture in equations</h2>
+<p>Everything above, written down precisely. Notation: \(x\) is the waveform,
+\(T\) the number of input frames, \(T'=T/4\) the encoder frames, \(d=256\) the
+model dimension, \(h=4\) heads, \(d_k=d/h=64\).</p>
+
+<div class="eq">
+<div class="lbl">Front end — waveform to log-mel</div>
+\[ X[k,t] \;=\; \sum_{n=0}^{N-1} w[n]\,x[tH+n]\,e^{-2\pi j kn/N},
+   \qquad N=512,\; H=160,\; w=\text{Hann}(400) \]
+\[ \operatorname{mel}(f)=2595\log_{10}\!\Big(1+\tfrac{f}{700}\Big),
+   \qquad
+   m_{b,t}=\log\Big(\textstyle\sum_{k} \mathcal{H}_{b,k}\,\big|X[k,t]\big|^{2}+\varepsilon\Big) \]
+<div class="lbl">Per-utterance CMVN</div>
+\[ \hat m_{b,t}=\frac{m_{b,t}-\mu_b}{\sigma_b+\varepsilon},
+   \qquad \mu_b=\tfrac1T\sum_t m_{b,t},\quad
+   \sigma_b^2=\tfrac1T\sum_t (m_{b,t}-\mu_b)^2 \]
+</div>
+
+<div class="tablewrap">
+<table>
+<tr><th>step</th><th>why it is there / what breaks without it</th></tr>
+<tr><td><strong>25 ms frames, 10 ms hop</strong></td>
+    <td>Speech is wildly non-stationary over a word but roughly <em>stationary over ~25 ms</em> — which is the window in which a Fourier transform is meaningful at all. The 10 ms overlap means an event straddling a frame boundary is never missed.</td></tr>
+<tr><td><strong>Hann window \(w[n]\)</strong></td>
+    <td>Cutting a sinusoid at an arbitrary boundary creates a discontinuity, and a discontinuity has energy at <em>every</em> frequency. Without tapering, that spectral leakage smears one clean formant across the whole spectrum.</td></tr>
+<tr><td><strong>\(|X|^2\) — discarding phase</strong></td>
+    <td>Phoneme identity lives in the spectral <em>envelope</em>, not the phase, so discarding phase costs recognition almost nothing and halves the input. It is not free everywhere: this is exactly why <a href="11-vocoder.html">TTS needs a vocoder</a> to invent phase back.</td></tr>
+<tr><td><strong>80 mel filters \(\mathcal{H}\)</strong></td>
+    <td>Two jobs at once. It <em>warps</em> frequency to match cochlear resolution (fine below 1 kHz, coarse above), and it <em>compresses</em> 257 FFT bins into 80 — deliberately blurring pitch harmonics, which vary by speaker, while preserving formants, which carry the phoneme.</td></tr>
+<tr><td><strong>\(\log(\cdot)\)</strong></td>
+    <td>Also two jobs. It compresses a ~120 dB dynamic range into a range a network can use, and — the subtle one — it converts <em>multiplicative</em> channel effects (microphone gain, room response) into <strong>additive offsets</strong>. That is the entire reason the next step can be a simple subtraction.</td></tr>
+<tr><td><strong>CMVN</strong></td>
+    <td>The log turned "this mic is 6 dB hotter" into a constant added to every frame of band \(b\); subtracting the per-band mean removes it exactly, so a different microphone lands in the same place in feature space. Skip it and the model burns capacity learning to subtract a per-recording constant, and training is measurably less stable.</td></tr>
+</table>
+</div>
+
+<div class="eq">
+<div class="lbl">Convolutional subsampling (×4) and its length map</div>
+\[ T' \;=\; \Big\lfloor \tfrac{\lfloor (T-1)/2\rfloor-1}{2} \Big\rfloor
+   \qquad\text{(two }3\times3\text{ convolutions, stride 2, no padding)} \]
+</div>
+<p><strong>Why:</strong> three distinct payoffs from one cheap module.
+<em>(i) Cost</em> — self-attention is \(O(T^2)\), so \(4\times\) fewer frames is a
+<strong>16×</strong> reduction in attention compute; this is what makes attention
+affordable on audio at all. <em>(ii) Redundancy</em> — adjacent 10 ms frames are
+nearly identical, so little information is lost. <em>(iii) Inductive bias</em> —
+a 2-D convolution over the (time, frequency) image extracts local,
+shift-invariant patterns such as formant transitions <em>before</em> attention
+ever runs, which is the job convolutions do better than attention.
+<br>The price: 40 ms becomes the finest alignment CTC can express, and \(T'\) is
+now the hard budget every subword must fit inside (§12.4).</p>
+
+<div class="eq">
+<div class="lbl">Conformer block — macaron sandwich</div>
+\[ \tilde{x} = x + \tfrac12\,\mathrm{FFN}(x) \]
+\[ x' = \tilde{x} + \mathrm{MHSA}\big(\mathrm{LN}(\tilde{x})\big) \]
+\[ x'' = x' + \mathrm{Conv}(x') \]
+\[ y = \mathrm{LN}\Big(x'' + \tfrac12\,\mathrm{FFN}(x'')\Big) \]
+</div>
+
+<p><strong>Why this shape.</strong> The block is deliberately a
+<em>sandwich</em>: transform → mix globally → mix locally → transform. Each
+piece does something the others cannot.</p>
+<div class="tablewrap">
+<table>
+<tr><th>sub-module</th><th>what it contributes</th><th>what it cannot do alone</th></tr>
+<tr><td><strong>½·FFN</strong> (×2, macaron)</td>
+    <td>Position-wise non-linear capacity — re-mixing the 256 channels at each frame independently. Two <em>half-weighted</em> FFNs around the attention empirically beat one full-weight FFN after it; that sandwich is where "macaron" comes from. This is also where two-thirds of the block's parameters live.</td>
+    <td>Cannot move information between time steps at all.</td></tr>
+<tr><td><strong>MHSA</strong> (relative position)</td>
+    <td>Global context in one hop: frame 5 can attend directly to frame 200. Essential for long-range agreement — the same word said twice, or a speaker's vowel space established seconds earlier.</td>
+    <td>Weak at short, precise, translation-invariant patterns; a softmax over 248 frames is a blunt tool for "was there a burst 20 ms ago?"</td></tr>
+<tr><td><strong>Conv module</strong> (depthwise k=31)</td>
+    <td>Exactly that short-range job: formant transitions, plosive bursts, the fine time structure that identifies a phone. 1.24 s of receptive field, at \(O(C\cdot k)\) cost instead of \(O(T^2)\).</td>
+    <td>Cannot reach beyond its kernel, however deep you stack it cheaply.</td></tr>
+<tr><td><strong>Residuals + final LayerNorm</strong></td>
+    <td>Keeps a short gradient path through 12 blocks and keeps activation scale bounded, so the stack trains without exotic initialisation.</td>
+    <td>—</td></tr>
+</table>
+</div>
+<p>The headline claim of Conformer is precisely this pairing: attention and
+convolution are <em>complementary</em>, not competing, so use both in every
+block rather than choosing.</p>
+
+<div class="eq">
+<div class="lbl">Relative-position self-attention (Transformer-XL form)</div>
+\[ e_{ij}=\frac{1}{\sqrt{d_k}}\Big[\;
+   \underbrace{(q_i+u)^{\!\top} k_j}_{\text{content} \,\times\, \text{content}}
+   \;+\;
+   \underbrace{(q_i+v)^{\!\top} W_p\, r_{\,i-j}}_{\text{content} \,\times\, \text{relative position}}
+   \;\Big] \]
+\[ \alpha_{ij}=\frac{M_{ij}\exp(e_{ij})}{\sum_{j'} M_{ij'}\exp(e_{ij'})},
+   \qquad z_i=\sum_j \alpha_{ij}\,v_j \]
+</div>
+
+<p><strong>Why each term exists.</strong> The first is
+content×content — "which other frames <em>sound</em> relevant to me". The second
+is content×position — "which <em>offsets</em> are relevant to me", e.g. a vowel
+attending to the burst 60 ms before it. Splitting them means the model can learn
+"look slightly back" as a rule independent of what it is currently hearing.</p>
+<p>The two learned vectors \(u,v\in\mathbb{R}^{d_k}\) are what remains of the
+absolute-position terms after the decomposition. \(u\) is a <em>global content
+bias</em> — which keys matter regardless of the query (silence, say) — and \(v\)
+a <em>global position bias</em> — which offsets matter regardless of the query.
+Both are cheap: \(2 \times 64\) numbers per head.</p>
+<p>Note what is <strong>absent</strong>: no position×position term, and no
+absolute index anywhere. The score depends only on \(i-j\), "40 ms earlier",
+never "frame 412". That is exactly why a model trained on 10 s utterances still
+works on 30 s ones — an absolute-position model would be extrapolating into
+embeddings it never saw during training.</p>
+
+<div class="eq">
+<div class="lbl">Dynamic chunk mask — one model, offline and streaming</div>
+\[ M_{ij}=\mathbb{1}\Big[\big\lfloor\tfrac{j}{C}\big\rfloor \le \big\lfloor\tfrac{i}{C}\big\rfloor\Big]
+   \cdot
+   \mathbb{1}\Big[\big\lfloor\tfrac{i}{C}\big\rfloor-\big\lfloor\tfrac{j}{C}\big\rfloor \le L\Big] \]
+</div>
+<p>\(C\) is the chunk width in encoder frames (\(C=16\Rightarrow 640\) ms of
+lookahead) and \(L\) the number of history chunks; \(C\!=\!0\) means full
+context. Resampling \(C\) every batch during training is what makes one set of
+weights work at any latency.</p>
+
+<div class="eq">
+<div class="lbl">Convolution module — the local half</div>
+\[ \mathrm{Conv}(x)=\mathrm{Drop}\Big(W_{p_2}*\;\mathrm{Swish}\big(\mathrm{BN}(\mathrm{DWConv}_{31}(\;\mathrm{GLU}(W_{p_1}*\mathrm{LN}(x))\;))\big)\Big) \]
+\[ \mathrm{GLU}(a,b)=a\odot\sigma(b),\qquad \mathrm{Swish}(x)=x\,\sigma(x) \]
+</div>
+<p><strong>Why each piece:</strong></p>
+<ul>
+<li><strong>Pointwise conv → GLU.</strong> \(W_{p_1}\) expands to \(2d\)
+channels, then GLU splits them in half and uses one half to <em>gate</em> the
+other. That is a multiplicative interaction — "let this feature through only if
+that other feature is present" — which a plain linear layer cannot express, and
+it costs one extra \(1{\times}1\) convolution.</li>
+<li><strong>Depthwise convolution, kernel 31.</strong> "Depthwise" means one
+filter per channel rather than a full \(C\times C\) mixing, so cost is
+\(O(C\cdot k)\) instead of \(O(C^2\cdot k)\) — roughly 256× cheaper here, which
+is what lets the kernel be as wide as 31. That width is \(31 \times 40\,\)ms =
+<strong>1.24 s</strong> of receptive field: syllable scale, precisely the range
+attention handles poorly.</li>
+<li><strong>BatchNorm → Swish.</strong> Normalisation keeps the pre-activation
+scale stable across a deep stack; Swish \(x\sigma(x)\) is smooth and
+non-monotonic, and empirically outperforms ReLU here — a small negative response
+is apparently useful rather than something to clip away.</li>
+<li><strong>Causal (left-only) padding.</strong> For streaming this is
+load-bearing: pad symmetrically and the module quietly reads ~15 frames of
+future, which would make the chunk mask a fiction and every latency number a
+lie. A test asserts this by re-encoding a prefix and requiring bit-identical
+output.</li>
+</ul>
+
+<div class="eq">
+<div class="lbl">Decoder layer (pre-norm) — one of 6</div>
+\[ g = g + \mathrm{SelfAttn}\big(\mathrm{LN}(g);\,M^{\text{causal}}\big),
+   \qquad M^{\text{causal}}_{uv}=\mathbb{1}[\,v \le u\,] \]
+\[ g = g + \mathrm{CrossAttn}\big(\mathrm{LN}(g),\; \underbrace{z}_{\text{encoder out}}\big) \]
+\[ g = g + \mathrm{FFN}\big(\mathrm{LN}(g)\big) \]
+</div>
+<p><strong>Why these three, in this order.</strong> <em>Self-attention</em> over
+the tokens emitted so far is what makes the decoder a language model — it is the
+only place \(y_{&lt;u}\) enters. The causal mask \(M^{\text{causal}}\) is not
+optional: without it token \(u\) can see token \(u{+}1\), the loss collapses to
+near zero, and WER stays at 100% — a failure that looks like spectacular
+training. <em>Cross-attention</em> is the only place the decoder touches the
+audio, and it is unmasked because the whole utterance is available. The
+<em>FFN</em> plays the same position-wise role as in the encoder.</p>
+<p><strong>Why pre-norm</strong> (LayerNorm <em>inside</em> the residual rather
+than after it): post-norm transformers need careful warmup and often diverge
+without it. Pre-norm keeps a clean identity path from input to output, so the
+stack trains stably — and given §12.6 is a story about a warmup mistake, having
+one less thing depending on warmup is worth the small quality trade.</p>
+
+<h2><span class="num">12.4</span>The loss function, in full</h2>
+
+<div class="eq">
+<div class="lbl">The objective</div>
+\[ \mathcal{L} \;=\; \lambda\,\mathcal{L}_{\mathrm{CTC}} \;+\; (1-\lambda)\,\mathcal{L}_{\mathrm{att}},
+   \qquad \lambda = 0.3 \]
+</div>
+
+<h3>Term 1 — CTC: learning <em>where</em> things are said</h3>
+<p>We have 248 encoder frames and, say, 30 subwords. Nobody told us which frames
+correspond to which subword. CTC solves this by introducing a
+<strong>blank</strong> symbol and defining a many-to-one collapse:</p>
+<pre><code>frame labels:  _ _ h h _ e l l _ l o _ _      (_ = blank)
+  merge repeats:      _ h _ e l _ l o _
+  drop blanks:          h   e l   l o          -> "hello"</code></pre>
+<p>Let \(\mathcal{B}\) be that collapse map, \(V\) the subword vocabulary plus
+blank \(\varnothing\), and \(y\) the target of length \(U\). The model emits a
+distribution over \(V\) at each of the \(T'\) encoder frames. The probability of
+the target is the sum over <em>every</em> frame labelling that collapses to it:</p>
+
+<div class="eq">
+<div class="lbl">CTC objective</div>
+\[ P(y\mid x)=\sum_{\pi\,\in\,\mathcal{B}^{-1}(y)}\;\prod_{t=1}^{T'} P(\pi_t\mid x),
+   \qquad
+   \mathcal{L}_{\mathrm{CTC}}=-\frac{1}{U}\log P(y\mid x) \]
+</div>
+
+<p>That sum has exponentially many terms, so it is computed by a
+forward-backward recursion over the <em>extended</em> target \(y'\) — the target
+with blanks interleaved, \(y'=(\varnothing,y_1,\varnothing,y_2,\dots,y_U,\varnothing)\),
+of length \(2U{+}1\):</p>
+
+<div class="eq">
+<div class="lbl">Forward recursion</div>
+\[ \alpha_t(s)=P(\pi_t=y'_s\mid x)\cdot
+\begin{cases}
+\alpha_{t-1}(s)+\alpha_{t-1}(s-1),
+  & y'_s=\varnothing \;\text{ or }\; y'_s=y'_{s-2}\\[4pt]
+\alpha_{t-1}(s)+\alpha_{t-1}(s-1)+\alpha_{t-1}(s-2), & \text{otherwise}
+\end{cases} \]
+\[ P(y\mid x)=\alpha_{T'}(2U{+}1)+\alpha_{T'}(2U) \]
+</div>
+
+<p>The two-case split <em>is</em> the blank's purpose. The three-term branch lets
+the path skip a blank and move straight to the next label; the two-term branch
+forbids that skip when the next label repeats the previous one, forcing a blank
+between them. Without it, "hello" and "helo" would be indistinguishable.</p>
+
+<div class="eq">
+<div class="lbl">Feasibility — the condition <code>zero_infinity</code> hides</div>
+\[ T' \;\ge\; U + r, \qquad r=\big|\{\,u:\;y_u=y_{u+1}\,\}\big| \]
+</div>
+<p>If this fails, \(P(y\mid x)=0\) and the loss is \(+\infty\);
+<code>zero_infinity=True</code> replaces it with a zero gradient rather than an
+error, so those utterances silently stop contributing. Speed perturbation at
+\(1.1\times\) shrinks \(T'\) by 10% without changing \(U\), which is why the
+preflight gate checks this at the fastest speed and counts repeats.</p>
+
+<div class="callout warn">
+<span class="label">Why the loss value looks wrong at initialisation</span>
+With <code>reduction="mean"</code> PyTorch divides by \(U\), the <em>target</em>
+length — while the path probability accumulates over all \(T'\) <em>frames</em>.
+For a uniform model, \(P(\pi_t)=1/|V|\) at every frame, so
+\[ \mathcal{L}^{(0)}_{\mathrm{CTC}} \;\approx\; \frac{T'}{U}\,\ln|V| \]
+With \(T'/U\approx 6\) and \(|V|=1024\) that is \(\approx 41\) — and we measured
+33–35. Expecting \(\ln|V|=6.93\) makes a perfectly healthy model look broken.
+This exact error was in our own validation script.
+</div>
+
+<div class="callout warn">
+<span class="label">Two facts about this number that mislead you</span>
+<strong>(a) reduction="mean" divides by TARGET length, not frame count.</strong>
+So an untrained model's CTC loss is roughly
+<code>(frames/token) × ln(V)</code>, not <code>ln(V)</code>. With ~6 frames per
+token and V=1024 that is ≈ 41, and we measured 33–35 at init. Reading it as
+"should start near ln(1024)=6.9" makes a healthy model look broken — a mistake
+that was in this repo's own validation script until it was corrected.
+<br><br>
+<strong>(b) <code>zero_infinity=True</code> silently drops impossible samples.</strong>
+If an utterance has more target tokens than encoder frames, CTC is infeasible;
+rather than erroring, that sample contributes a zero gradient. Choose a bad
+vocabulary and you quietly train on a fraction of your data with no warning.
+The preflight gate now checks this explicitly.
+</div>
+
+<h3>Term 2 — attention: learning <em>what</em> is said</h3>
+<p>CTC's tractability comes from a strong assumption:
+<strong>conditional independence</strong> — given the audio, each frame's label
+is predicted without reference to its neighbours. That is exactly why a
+CTC-only model can emit orthographically impossible text — formally, CTC
+factorises as</p>
+<div class="eq">
+\[ P_{\mathrm{CTC}}(\pi\mid x)=\prod_{t} P(\pi_t\mid x)
+   \qquad\text{— no } \pi_{&lt;t} \text{ on the right-hand side.} \]
+</div>
+<p>The decoder removes that assumption by conditioning on its own history:</p>
+<div class="eq">
+<div class="lbl">Attention objective, with label smoothing</div>
+\[ P_{\mathrm{att}}(y\mid x)=\prod_{u=1}^{U+1} P\big(y_u \,\big|\, y_{&lt;u},\,x\big) \]
+\[ \mathcal{L}_{\mathrm{att}}
+   = -\frac{1}{U+1}\sum_{u=1}^{U+1}\sum_{c\in V} \tilde q_u(c)\,
+     \log P\big(y_u = c \mid y_{&lt;u}, x\big) \]
+\[ \tilde q_u(c) = (1-\epsilon)\,\delta_{c,\,y_u} + \frac{\epsilon}{|V|},
+   \qquad \epsilon = 0.1 \]
+</div>
+<p>Targets are wrapped as \(y_{\text{in}}=(\texttt{sos},y_1,\dots,y_U)\) and
+\(y_{\text{out}}=(y_1,\dots,y_U,\texttt{eos})\) with one shared sos/eos token, so
+the \(U{+}1\)-th step is "predict that the utterance is over" — stopping is
+<em>learned</em>, not a heuristic. Padding positions use \(\varnothing\) as the
+ignore index, which is unambiguous because blank can never be an attention
+target.</p>
+
+<div class="eq">
+<div class="lbl">Decoding — CTC proposes, the decoder rescores</div>
+\[ \hat y=\arg\max_{y\,\in\,\mathcal{N}(x)}\Big[\,
+     \lambda_d \log P_{\mathrm{CTC}}(y\mid x)
+     +(1-\lambda_d)\log P_{\mathrm{att}}(y\mid x)\Big],
+   \qquad \lambda_d=0.5 \]
+</div>
+<p>\(\mathcal{N}(x)\) is the n-best list from CTC prefix beam search. Because the
+decoder only <em>scores</em> a fixed candidate set, it runs once per hypothesis
+in a single batched forward — far cheaper than an autoregressive beam search,
+which would evaluate it once per output token per beam.</p>
+
+<div class="callout prod">
+<span class="label">Why both, on one encoder</span>
+Each head fixes the other's failure mode. CTC is <strong>monotonic by
+construction</strong>, which stops the attention from wandering or looping — the
+same failure Module 4's TTS needed guided attention to avoid. The decoder
+supplies the <strong>implicit language model</strong> CTC structurally cannot
+have. One encoder pays for both, and at decode time the same split is reused:
+CTC beam search proposes an n-best list, the decoder rescores it in a single
+batched forward.
+</div>
+
+<h2><span class="num">12.5</span>The methodology around the loss</h2>
+
+<h3>Batching — by frames, not by count</h3>
+<p>Utterances vary from 1 s to 16 s. Batching by <em>count</em> means one 16 s
+clip forces twelve 2 s clips to be padded to 16 s, and most of the GPU computes
+zeros. We bucket by length and fill each batch to a <strong>frame budget</strong>,
+so batches are length-homogeneous and padding is small. The cost of a batch is
+<code>batch_size × longest</code>, which is what the budget caps.</p>
+
+<h3>Augmentation — three levels, and when each switches on</h3>
+<div class="tablewrap">
+<table>
+<tr><th>level</th><th>what</th><th>why</th></tr>
+<tr><td>waveform</td><td>speed perturb 0.9× / 1.0× / 1.1×</td><td>triples the corpus; shifts pitch too, so it is really <em>speaker</em> augmentation</td></tr>
+<tr><td>waveform</td><td>noise mixing at 5–20 dB SNR</td><td>a model that has only heard studio speech collapses on a phone call</td></tr>
+<tr><td>features</td><td>SpecAugment: 2 frequency masks (≤27 bins), 5 time masks (≤5% each)</td><td>forces inference from partial evidence; the highest-leverage line in any small-data recipe</td></tr>
+</table>
+</div>
+<p>Augmentation is <strong>delayed</strong> until the alignment forms
+(<code>AUG_START</code>). Measured on this project: with SpecAugment on from step
+0, CTC reached 1.06 by step 400 on a small subset; with it off, 0.13. Regularising
+a model that hasn't learned the task yet only lengthens the plateau.</p>
+
+<div class="callout warn">
+<span class="label">A subtlety that invalidates a naive feasibility check</span>
+Speed perturbation at 1.1× shortens the audio by 10% but leaves the transcript
+unchanged — so the frames-per-token ratio the model actually trains on is
+<em>worse</em> than the one you compute from raw durations. And CTC needs a
+blank between adjacent repeated tokens, so the true requirement is
+<code>frames ≥ tokens + repeats</code>. Validating on raw durations without
+repeats flatters you on both counts.
+</div>
+
+<h3>Learning-rate schedule — the part we got wrong</h3>
+<div class="eq">
+<div class="lbl">Ours: linear warmup, then cosine decay to a floor</div>
+\[ \eta(s)=\eta_{\max}\cdot
+\begin{cases}
+\dfrac{s}{S_w}, & s &lt; S_w \\[10pt]
+\phi+(1-\phi)\cdot\dfrac{1}{2}\left(1+\cos\pi\dfrac{s-S_w}{S-S_w}\right), & s \ge S_w
+\end{cases} \]
+\[ \eta_{\max}=10^{-3},\quad \phi=0.05,\quad S=15000,\quad
+   S_w=\underbrace{1500}_{\text{what we used}}\;\text{vs}\;\underbrace{15000}_{\text{reference}} \]
+</div>
+<p>For comparison, ESPnet and WeNet use the inverse-square-root (Noam) form,
+which never fully decays and warms up far more slowly:</p>
+<div class="eq">
+<div class="lbl">Reference: Noam / warmuplr</div>
+\[ \eta(s)=\eta_{\max}\cdot \sqrt{S_w}\cdot\min\!\big(s^{-1/2},\; s\,S_w^{-3/2}\big) \]
+</div>
+<p>Warmup is not decoration. At step 0 the attention weights are near-uniform,
+so \(\partial \mathcal{L}/\partial e_{ij}\) is large and badly conditioned; a
+full-size step there reliably lands the model in a bad basin. With
+\(S_w=1500\) our learning rate hit its peak at step 1,500 — and the CTC loss
+went flat at step ≈1,200 and never recovered. The literature names this exact
+mechanism (§12.6).</p>
+
+<h2><span class="num">12.6</span>What we watch, and the failure we hit</h2>
+<p>Three signals, in order of how early they tell you something:</p>
+<div class="tablewrap">
+<table>
+<tr><th>signal</th><th>healthy</th><th>what it caught</th></tr>
+<tr><td><strong>blank-frame fraction</strong><br>share of encoder frames whose CTC argmax is blank</td><td>rises to ~0.85–0.95, then <em>comes down</em></td><td><strong>pinned at 1.0000</strong> — the model had stopped emitting labels entirely</td></tr>
+<tr><td>CTC loss</td><td>falls, plateaus, then falls off a cliff</td><td>flat at 5.88 for 2,000 steps</td></tr>
+<tr><td>held-out WER</td><td>falls after the CTC cliff</td><td>0.978 → 1.000 → 0.995, i.e. nothing</td></tr>
+</table>
+</div>
+
+<div class="callout warn">
+<span class="label">CTC blank collapse — what actually happened</span>
+The model discovered that emitting <code>&lt;blank&gt;</code> on <em>every</em>
+frame is a safe, finite-loss answer, and converged into it: 100% of frames
+decoding to blank, mean P(blank) 0.89, output entropy 0.82 nats out of a possible
+6.93, and greedy decoding returning the empty string. It does not recover on its
+own.
+<br><br>
+This is invisible in the loss (which just goes flat at a plausible-looking value)
+and invisible in WER (which pins at 1.0 — indistinguishable from "still early").
+That is why <strong>blank-frame fraction is now logged at every evaluation</strong>,
+with an explicit stop message.
+</div>
+
+<h3>The diagnosis, from the literature rather than from guessing</h3>
+<p><a href="https://arxiv.org/pdf/2105.14849">"Why does CTC result in peaky
+behavior?"</a> identifies blank-dominated convergence as a property of <em>local</em>
+convergence, and names the aggravating conditions — chief among them
+<strong>aggressive learning rates during early training</strong>, with
+<strong>learning-rate warmup</strong> as the first listed mitigation.</p>
+
+<p>Our warmup was <strong>1,500 steps</strong>. Every reference recipe uses
+15,000–35,000. The learning rate reached its peak at step 1,500; CTC went flat
+at step ~1,200 and never recovered.</p>
+
+<h2><span class="num">12.7</span>Our config against the reference</h2>
+<p><a href="https://huggingface.co/pyf98/librispeech_100h_conformer">ESPnet's
+LibriSpeech-100h Conformer</a> — same corpus, and its encoder is
+<em>identical</em> to ours.</p>
+
+<div class="tablewrap">
+<table>
+<tr><th></th><th>ESPnet 100h</th><th>WeNet</th><th>ours (collapsed)</th><th>corrected</th></tr>
+<tr><td>encoder</td><td>12 × d256, 4 heads, FF1024, k31</td><td>12 × d256</td><td>same ✓</td><td>same</td></tr>
+<tr><td>decoder</td><td>6 layers, FF2048</td><td>6</td><td>4 layers</td><td><strong>6</strong></td></tr>
+<tr><td>learning rate</td><td>2e-3</td><td>1e-3</td><td>1e-3 ✓</td><td>1e-3</td></tr>
+<tr><td><strong>warmup steps</strong></td><td><strong>15,000</strong></td><td><strong>25–35,000</strong></td><td><strong>1,500</strong></td><td><strong>15,000</strong></td></tr>
+<tr><td>epochs</td><td>70</td><td>120</td><td>~20</td><td>~70</td></tr>
+<tr><td>weight decay</td><td>1e-6</td><td>—</td><td><strong>1e-2</strong></td><td><strong>1e-6</strong></td></tr>
+<tr><td>BPE vocab</td><td>5,000</td><td>—</td><td>1,024</td><td>1,024</td></tr>
+<tr><td>ctc_weight</td><td>0.3</td><td>—</td><td>0.3 ✓</td><td>0.3</td></tr>
+<tr><td>SpecAug time masks</td><td>5</td><td>—</td><td>2</td><td><strong>5</strong></td></tr>
+<tr><td>WER test-clean</td><td><strong>8.4%</strong></td><td>—</td><td>—</td><td>target ~10–15%</td></tr>
+</table>
+</div>
+
+<div class="callout">
+<span class="label">The hypothesis this killed</span>
+Before doing the reading, the plan was to blame the <strong>vocabulary</strong>
+and restart at 256. ESPnet uses <strong>5,000</strong> BPE units on this exact
+corpus and reaches 8.4% WER — so vocabulary was never the problem. Had we
+"fixed" it that way and it happened to work, we would have learned the wrong
+lesson permanently.
+</div>
+
+<h2><span class="num">12.8</span>What a correct run costs</h2>
+<p>At the measured 1.53 it/s on an RTX A4000, one epoch of train-clean-100 is
+roughly 750–900 optimizer steps.</p>
+<div class="tablewrap">
+<table>
+<tr><th>option</th><th>steps</th><th>warmup</th><th>wall clock</th><th>cost</th><th>expected</th></tr>
+<tr><td>reference recipe (~70 epochs)</td><td>~55,000</td><td>15,000</td><td>~10 h</td><td>~$1.70</td><td>WER ~10–15%</td></tr>
+<tr><td>half recipe</td><td>~28,000</td><td>8,000</td><td>~5 h</td><td>~$0.85</td><td>WER ~18–25%</td></tr>
+<tr><td>fix verification only</td><td>6,000</td><td>2,000</td><td>~1.1 h</td><td>~$0.20</td><td>proves blank-fraction falls; not a usable model</td></tr>
+</table>
+</div>
+<p>The honest summary of what went wrong at the top level: we were trying to do
+in 2.5 hours what the reference does in 10. No single hyperparameter was going to
+fix that.</p>
+
+<h2><span class="num">12.9</span>Reading the logs</h2>
+<pre><code>step   2500 | ctc  5.886 | att  4.763 | lr 9.87e-04 | gnorm 0.44 | 1.53 it/s
+    held-out WER @ 3000: 0.995 (best 0.978) | blank-frames 1.000  *** CTC BLANK COLLAPSE ***
+
+  ctc      ~41 at init (= frames/token × ln V), should fall then cliff
+  att      ~ln(V) = 6.9 at init, should fall steadily from the start
+  lr       must ramp slowly — reaching peak early is what caused the collapse
+  gnorm    0.3–2.0 is healthy; spikes mean a bad batch, sustained &gt;5 means trouble
+  it/s     1.5 on an A4000 at 6 dataloader workers; 0.4 means something else
+           is sharing the GPU
+  blank-frames  the canary. 1.000 = dead.</code></pre>
+
+<h2><span class="num">12.10</span>Where the code lives</h2>
+<div class="tablewrap">
+<table>
+<tr><th>file</th><th>role</th></tr>
+<tr><td><code>src/asr/tokenizer.py</code></td><td>BPE, trained from the transcripts; carries a corpus fingerprint so it can't be reused across datasets</td></tr>
+<tr><td><code>src/asr/corpus.py</code></td><td>manifest, augmentation, CMVN, length-bucketed dynamic batching</td></tr>
+<tr><td><code>src/asr/conformer.py</code></td><td>subsampling, relative-position attention, conv module, chunk masks</td></tr>
+<tr><td><code>src/asr/hybrid.py</code></td><td>the two heads, the joint loss, attention rescoring</td></tr>
+<tr><td><code>src/asr/search.py</code></td><td>log-space CTC prefix beam, WER</td></tr>
+<tr><td><code>src/checkpoint.py</code></td><td>atomic model+optimizer+step resume</td></tr>
+<tr><td><code>scripts/11_train_asr_conformer.py</code></td><td>the training loop</td></tr>
+<tr><td><code>scripts/14_validate.py</code></td><td>preflight gate — run before renting a GPU</td></tr>
+<tr><td><code>scripts/15_collapse_probe.py</code></td><td>reproduces blank collapse and isolates the cause</td></tr>
+</table>
+</div>
+
+</main>
+<footer class="nav">
+  <a href="10-modern-asr.html">← Modern ASR</a>
+  <a href="11-vocoder.html">Next: Vocoder →</a>
+</footer>
+</body>
+</html>

@@ -14,13 +14,46 @@
      only thing still separating us from a production model is data.</p>
 </header>
 <main>
-<div class="crumbs"><a href="index.html">← hub</a> · <a href="08-sota.html">state of the art</a> · <a href="03-asr.html">module 2 asr</a></div>
+<div class="crumbs"><a href="index.html">← contents</a> · <a href="00-crux.html">the crux</a> · <a href="08-sota.html">state of the art</a> · <a href="03-asr.html">module 2 asr</a></div>
 
-<h2><span class="num">10.1</span>What changed, and why each change</h2>
-<p><a href="08-sota.html">§8</a> concluded that ASR was the one stage where the
-gap was "everything at once". This module closes the parts that are <em>not</em>
-data. Every row here is a thing that had to change before more data could even
-help.</p>
+<h2><span class="num">10.1</span>Start from the failure</h2>
+
+<p>Here is Module 2 — a CTC BiGRU, trained on real LibriSpeech — transcribing a
+real utterance:</p>
+
+<pre><code>hyp: he inl san er mianthes tlen kis roint the stieia sord meai wen
+ref: but in less than five minutes the staircase groaned beneath an
+     extraordinary weight</code></pre>
+
+<p>Before reading on, it is worth asking what <em>kind</em> of failure that is.
+It would be easy to say "it needs more data" and move on. But look closely:
+the rhythm is roughly right, the syllable count is roughly right, many vowels
+are roughly right. This is not a model that cannot hear. It is a model that
+hears reasonably and then writes something no English speaker could produce.</p>
+
+<p>Diagnose it properly and there are <strong>four separate defects</strong>,
+only one of which more data would help:</p>
+
+<div class="tablewrap">
+<table>
+<tr><th>#</th><th>defect</th><th>the evidence</th><th>would more data fix it?</th></tr>
+<tr><td>1</td><td><strong>No language model.</strong> CTC predicts each frame independently, so nothing knows that "mianthes" is not a word</td><td>orthographically impossible output</td><td>no — it is structural</td></tr>
+<tr><td>2</td><td><strong>Lossy long-range memory.</strong> A GRU squeezes all history through one fixed-size state</td><td>context beyond a few words is unavailable</td><td>no</td></tr>
+<tr><td>3</td><td><strong>Cannot stream, at any setting.</strong> Bidirectional means frame 1's output depends on frame N's input</td><td>unusable in a live agent</td><td>no</td></tr>
+<tr><td>4</td><td><strong>Cannot absorb more data.</strong> No augmentation, no LR schedule, character targets</td><td>held-out error stayed high while training error fell</td><td><em>this is the one</em> — and it is gated on fixing the others first</td></tr>
+</table>
+</div>
+
+<div class="crux-q">
+<strong>The point of this chapter.</strong> <a href="08-sota.html">§8</a>
+concluded ASR was the one stage where the gap was "everything at once". Three of
+those four defects are <em>architectural</em> — no quantity of audio touches them.
+So the honest order of work is: fix the architecture first, and only then does
+"get more data" become the correct next move. Every row in the table below is
+the answer to one diagnosed defect, not a modernisation for its own sake.
+</div>
+
+<h2><span class="num">10.1b</span>One row per defect, and its fix</h2>
 
 <div class="tablewrap">
 <table>
@@ -46,15 +79,14 @@ help.</p>
 </table>
 </div>
 
-<h2><span class="num">10.2</span>Subwords: the cheapest large win</h2>
-<p>Module 2's transcription of a real utterance was:</p>
-<pre><code>hyp: he inl san er mianthes tlen kis roint the stieia sord meai wen
-ref: but in less than five minutes the staircase groaned beneath an
-     extraordinary weight</code></pre>
-<p>Look at what kind of error that is. It is not acoustically stupid — the
-rhythm and many vowels are right. It is <em>orthographically impossible</em>:
-no English word looks like "mianthes". A character model has to learn spelling
-through the acoustic model, from scratch, from a few hours of audio.</p>
+<h2><span class="num">10.2</span>Subwords: the cheapest large win — defect 1, part one</h2>
+<p>Return to "mianthes". A <em>character</em> model has to learn English spelling
+through the acoustic model, from scratch, from a few hours of audio — every
+letter is an independent decision, so nothing prevents a sequence of individually
+plausible letters from forming an impossible word.</p>
+<p>There are two ways to attack that, and we use both. The decoder in §10.5 is
+the heavyweight fix. The cheap one comes first: <strong>change what a "symbol"
+is.</strong></p>
 <p>BPE (<code>src/asr/tokenizer.py</code>, ~150 lines, no dependency) fixes this
 structurally. Start with characters; repeatedly merge the most frequent adjacent
 pair; stop at <em>V</em> tokens. The model then emits <code>▁recogn</code> +
@@ -67,7 +99,7 @@ to the same string and detokenization has to guess. With it, decoding is
 "concatenate everything, turn ▁ into a space" — exact, always.
 </div>
 
-<h2><span class="num">10.3</span>The Conformer block</h2>
+<h2><span class="num">10.3</span>The Conformer block — defect 2</h2>
 <div class="diagram">x ← x + ½·<span class="a">FFN</span>(x)        <span class="m">macaron: half a feed-forward before…</span>
 x ← x + <span class="b">MHSA</span>(x)          <span class="m">global context, RELATIVE positions</span>
 x ← x + <span class="c">Conv</span>(x)          <span class="m">local context, depthwise, kernel 31 ≈ 150 ms</span>
@@ -100,7 +132,7 @@ attention cost. It is what makes self-attention affordable for audio at all.
 (FastConformer pushes this to ×8 with depthwise-separable convs — the single
 biggest remaining efficiency win available to this code.)</p>
 
-<h2><span class="num">10.4</span>Streaming, and the test that proves it</h2>
+<h2><span class="num">10.4</span>Streaming — defect 3</h2>
 <p>Module 2's BiGRU could not stream at any setting: bidirectional means the
 first frame's output depends on the last frame's input. Module 6 streams by
 construction, using two mechanisms that must both hold:</p>
@@ -130,7 +162,7 @@ passes for the wrong reason is worse than no test; this proves the first one is
 actually measuring something.
 </div>
 
-<h2><span class="num">10.5</span>Two heads on one encoder</h2>
+<h2><span class="num">10.5</span>Two heads on one encoder — defect 1, part two</h2>
 <div class="diagram">feats ─▶ <span class="a">Conformer encoder</span> ─┬─▶ <span class="b">CTC head</span>         ─▶ L_ctc   <span class="m">alignment</span>
                             └─▶ <span class="c">Transformer dec</span>  ─▶ L_att   <span class="m">language</span>
 
@@ -332,8 +364,8 @@ a fixed chunk (what the latency costs).</p>
 
 </main>
 <footer class="nav">
-  <a href="09-turn-detection.html">← Telephony turn detection</a>
-  <a href="index.html">Back to the hub →</a>
+  <a href="05-production.html">← Production</a>
+  <a href="12-training-run.html">Next: What we are training →</a>
 </footer>
 </body>
 </html>

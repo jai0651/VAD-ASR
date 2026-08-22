@@ -14,7 +14,7 @@
      Code: <code>src/tts/</code>, trained by <code>scripts/08_train_tts.py</code>.</p>
 </header>
 <main>
-<div class="crumbs"><a href="index.html">← hub</a> · <a href="03-asr.html">asr</a></div>
+<div class="crumbs"><a href="index.html">← contents</a> · <a href="00-crux.html">the crux</a> · <a href="03-asr.html">asr</a></div>
 
 <h2><span class="num">4.1</span>The two-stage decomposition</h2>
 <div class="diagram">
@@ -33,10 +33,35 @@ the stages end-to-end for quality, but you can't see <em>why</em> that helps unt
 felt the seam.</p>
 
 <h2><span class="num">4.2</span>The acoustic model: attention decides time</h2>
-<p>ASR's alignment problem, inverted. CTC <em>discovered</em> the alignment hidden in the
-audio; TTS must <em>decide</em> one — how many frames is the "o" in "go"? Tacotron's answer:
-generate mel frames autoregressively, and at every step use <strong>attention over the
-text</strong> to know where you are:</p>
+
+<p>You have already met this problem. In <a href="03-asr.html">Chapter 3</a> we
+had 400 audio frames and 3 characters, and no idea which frames belonged to
+which character. CTC's answer was: don't choose — sum over every alignment and
+let the model discover one.</p>
+
+<p>Now run it backwards. You have 19 characters and you must produce
+<em>roughly 250 mel frames</em>. Same missing correspondence, but this time you
+cannot dodge it:</p>
+
+<div class="tablewrap"><table>
+<tr><th></th><th>ASR (Chapter 3)</th><th>TTS (here)</th></tr>
+<tr><td>you are given</td><td>400 frames, 3 characters</td><td>19 characters</td></tr>
+<tr><td>you must produce</td><td>the text</td><td>250 frames — <strong>and you must decide it is 250</strong></td></tr>
+<tr><td>the alignment is</td><td>hidden in the audio, waiting to be found</td><td>not there at all; it must be invented</td></tr>
+<tr><td>can you sum over all of them?</td><td>yes — that's CTC</td><td><strong>no.</strong> You have to emit <em>one</em> sequence</td></tr>
+</table></div>
+
+<p>That last row is the whole difficulty. CTC could stay agnostic because it only
+ever had to <em>score</em> a target you already had. A synthesizer has no target
+— it is producing the output — so at every step it must commit: is the "o" in
+"go" over yet, or does it hold for another 40 ms? Get that wrong repeatedly and
+you don't get a slightly wrong transcript, you get speech that stutters, skips a
+syllable, or never stops.</p>
+
+<p>Tacotron's answer: generate mel frames one step at a time, and at every step
+use <strong>attention over the text</strong> to answer "which character am I on
+right now?" The attention <em>is</em> the alignment — being built as it goes,
+rather than discovered after the fact:</p>
 <div class="diagram">
  every decoder step (= r mel frames):
    1  prenet(previous frame)            <span class="m">"what did I just say?"</span>
@@ -154,7 +179,7 @@ token stream at the first sentence boundary and start TTS while the LLM is still
 </main>
 <footer class="nav">
   <a href="03-asr.html">← ASR</a>
-  <a href="05-production.html">Next: Production inference →</a>
+  <a href="07-denoise.html">Next: Noise suppression →</a>
 </footer>
 </body>
 </html>

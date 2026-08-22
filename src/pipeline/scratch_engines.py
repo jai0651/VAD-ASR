@@ -167,6 +167,17 @@ class ConformerASR:
         self.tokenizer = BPETokenizer.load(_require(
             tok_path, "uv run python scripts/11_train_asr_conformer.py"
         ))
+        # Refuse a tokenizer that isn't the one this checkpoint was trained
+        # with. Token ids are meaningless across BPE fits, and the failure is
+        # silent: the model still emits fluent-looking text, just misspelled.
+        want = state.get("tokenizer_corpus", "")
+        if want and self.tokenizer.corpus != want:
+            raise RuntimeError(
+                f"tokenizer mismatch for {ckpt}: checkpoint was trained with "
+                f"corpus {want!r} but {tok_path} is {self.tokenizer.corpus!r}. "
+                f"The ids do not line up — retrain, or restore the original "
+                f"tokenizer file."
+            )
         self.cfg = cfg
         self.beam_size = beam_size
         self.chunk_size = cfg.conformer_chunk

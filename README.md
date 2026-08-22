@@ -185,13 +185,24 @@ Run the tests: `uv run pytest -q` (endpointing, orchestrator/barge-in, audio I/O
 
 ## Learn the deep internals (docs/)
 
-Open `docs/index.html` — a set of deep-dive pages written alongside this code:
-pipeline architecture, VAD, ASR, TTS, noise suppression, production inference,
-a decision log recording *why* each design choice was made — plus
-`docs/08-sota.html` (what the state of the art actually is in 2026, why those
-architectures won, and how close from-scratch models can get) and
-`docs/09-turn-detection.html` (a concrete plan for an open model that beats the
-current best where it is weakest).
+**Open `docs/index.html`.** The docs are structured as a book with a reading
+order, not a pile of pages:
+
+| | |
+|---|---|
+| **Part 0 · Synthesis** | [`00-crux.html`](docs/00-crux.html) — **start here.** Mind maps, one idea + one number per module, the full failure catalogue grouped by lesson, ten transferable principles, and interview questions with answers grounded in what we measured |
+| **Part 1 · The real-time loop** | pipeline architecture, production inference |
+| **Part 2 · The models** | VAD → ASR → TTS → noise suppression, in build order |
+| **Part 3 · To the state of the art** | modern Conformer, the full training maths, the neural vocoder |
+| **Part 4 · The field** | where SOTA is, and where a small team can still win |
+| **Appendix** | 28 numbered decisions, including the ones tried and rejected |
+
+Reading paths are on the contents page: 30 minutes to be able to explain the
+project, or an afternoon for the whole build.
+
+Every chapter was written alongside the code it describes, and records the
+failures as well as the results — the failure catalogue in Part 0 is the most
+useful thing in the repo.
 
 ## Real speech (LibriSpeech)
 

@@ -14,13 +14,34 @@
      <code>server/app.py</code>, <code>client/</code>.</p>
 </header>
 <main>
-<div class="crumbs"><a href="index.html">← hub</a></div>
+<div class="crumbs"><a href="index.html">← contents</a> · <a href="00-crux.html">the crux</a></div>
 
 <h2><span class="num">1.1</span>Why a pipeline at all?</h2>
-<p>A voice agent is not "an ASR model". It's a <strong>conversation loop</strong> with
-hard real-time constraints: audio arrives forever, 16,000 samples per second, and the
-product-defining question is not "what did they say?" but <strong>"when do I get to
-answer, and how fast?"</strong>. That forces a decomposition:</p>
+
+<p>Imagine you have a perfect speech recognizer. Zero errors, instant. Now build
+a voice assistant with it.</p>
+
+<p>You immediately hit questions the recognizer cannot answer:</p>
+<ul>
+<li>The microphone is <em>always</em> on. What do you even feed it? The last
+second? Everything since the app started?</li>
+<li>The user pauses mid-sentence to think. Do you answer now, or wait? If you
+answer, you have interrupted them. If you wait, how long — and what if they were
+actually finished?</li>
+<li>The user starts talking while your agent is still speaking. Does the agent
+stop? Can it even <em>hear</em> them while it talks?</li>
+</ul>
+
+<p>None of those are recognition problems. A perfect ASR model leaves every one
+of them unsolved — and they are what people mean when they say an assistant
+"feels" good or bad. A voice agent is not an ASR model; it is a
+<strong>conversation loop</strong> with hard real-time constraints, and the
+product-defining question is not "what did they say?" but <strong>"when do I get
+to answer, and how fast?"</strong></p>
+
+<p>Audio arrives forever, 16,000 samples per second, and never stops to let you
+think. That forces a decomposition — each stage answering exactly one question,
+at a very different cost:</p>
 
 <div class="tablewrap"><table>
 <tr><th>Stage</th><th>Question it answers</th><th>Runs</th><th>Cost</th></tr>
@@ -32,9 +53,20 @@ answer, and how fast?"</strong>. That forces a decomposition:</p>
 <tr><td><strong>Orchestrator</strong></td><td>Who runs when, and who gets cancelled?</td><td>always</td><td>the hard part</td></tr>
 </table></div>
 
-<p>The expensive stages are <em>gated</em> by the cheap ones — that's the economic
-shape of every production voice system: a free always-on detector deciding when to
-wake the costly models. This is also why VAD models are 2 MB, not 2 GB.</p>
+<p>Read the cost column top to bottom. It spans five orders of magnitude, and
+that gradient <em>is</em> the architecture: <strong>the expensive stages are
+gated by the cheap ones.</strong> A free always-on detector decides when to wake
+the costly models. That is the economic shape of every production voice system,
+and it is why VAD models are 2 MB and not 2 GB — a VAD that cost as much as the
+ASR would defeat its own purpose.</p>
+
+<div class="crux-q">
+<strong>Where we're going.</strong> The three questions above map onto the rest
+of this chapter: what to feed the model becomes <em>the wire protocol</em>
+(§1.2); when to answer becomes <em>the state machine</em> (§1.3); and "can it
+hear me while it talks" turns out to dictate the entire threading model
+(§1.4) — the least obvious and most important consequence in the whole design.
+</div>
 
 <h2><span class="num">1.2</span>The wire protocol</h2>
 <p>One WebSocket per session (<code>server/app.py</code>). Two frame types each way —
@@ -188,8 +220,8 @@ orchestrator can't tell your 55k-param VADNet from Silero. Three payoffs:</p>
 
 </main>
 <footer class="nav">
-  <a href="index.html">← Hub</a>
-  <a href="02-vad.html">Next: VAD deep dive →</a>
+  <a href="00-crux.html">← The Crux</a>
+  <a href="02-vad.html">Next: VAD →</a>
 </footer>
 </body>
 </html>

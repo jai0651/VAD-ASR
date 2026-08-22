@@ -34,6 +34,7 @@ Two systems details that are not optional:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -78,7 +79,7 @@ def cmvn(feats: torch.Tensor) -> torch.Tensor:
 
 
 def spec_augment(feats: torch.Tensor, n_freq: int = 2, freq_width: int = 27,
-                 n_time: int = 2, time_ratio: float = 0.05,
+                 n_time: int = 5, time_ratio: float = 0.05,
                  max_time_width: int = 40) -> torch.Tensor:
     """Mask bands and spans in place-ish. feats: (T, n_mels)."""
     t, f = feats.shape
@@ -260,13 +261,33 @@ class DynamicBatchSampler(torch.utils.data.Sampler):
         return len(self.batches)
 
 
+def corpus_fingerprint(items: list[dict]) -> str:
+    """Cheap, stable identifier for the text a tokenizer was fitted on."""
+    h = hashlib.sha1()
+    for it in items[:: max(1, len(items) // 200)]:
+        h.update(it["text"].encode())
+    return f"n={len(items)}:{h.hexdigest()[:12]}"
+
+
 def build_tokenizer(items: list[dict], vocab_size: int, path: str | Path) -> BPETokenizer:
+    """Load a cached tokenizer only if it matches BOTH the size and the corpus.
+
+    Checking size alone silently reused a dev-clean tokenizer for a
+    train-clean-100 run. Nothing errored: BPE merges fitted on 2,557 utterances
+    still encode English, just worse, and the damage is invisible except as
+    slightly-degraded training.
+    """
     path = Path(path)
+    fingerprint = corpus_fingerprint(items)
     if path.exists():
         tok = BPETokenizer.load(path)
-        if tok.vocab_size == vocab_size:
+        if tok.vocab_size == vocab_size and tok.corpus == fingerprint:
             return tok
+        why = ("vocab size" if tok.vocab_size != vocab_size
+               else f"different corpus (cached {tok.corpus or '?'}, want {fingerprint})")
+        print(f"retraining tokenizer {path.name}: {why}")
     tok = BPETokenizer.train((it["text"] for it in items), vocab_size=vocab_size)
+    tok.corpus = fingerprint
     path.parent.mkdir(parents=True, exist_ok=True)
     tok.save(path)
     return tok

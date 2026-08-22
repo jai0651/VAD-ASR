@@ -52,6 +52,7 @@ from src.asr.corpus import (  # noqa: E402
 )
 from src.asr.hybrid import HybridCTCAttention, count_parameters  # noqa: E402
 from src.asr.search import corpus_wer  # noqa: E402
+from src.asr.tokenizer import BLANK_ID  # noqa: E402
 from src.checkpoint import clear_resume, load_resume, save_resume  # noqa: E402
 
 OUT = Path("outputs")
@@ -60,7 +61,7 @@ OUT = Path("outputs")
 # `small` is the real one and is roughly the size of a deployable streaming ASR.
 SIZES = {
     "tiny":  dict(d_model=144, n_layers=6,  n_heads=4, decoder_layers=2),
-    "small": dict(d_model=256, n_layers=12, n_heads=4, decoder_layers=4),
+    "small": dict(d_model=256, n_layers=12, n_heads=4, decoder_layers=6),
     "base":  dict(d_model=384, n_layers=16, n_heads=6, decoder_layers=6),
 }
 
@@ -69,7 +70,14 @@ DOWNLOAD = os.environ.get("DOWNLOAD", "0") == "1"
 STEPS = int(os.environ.get("STEPS", "3000"))
 SIZE = os.environ.get("SIZE", "tiny")
 LR = float(os.environ.get("LR", "1e-3"))
-WARMUP = int(os.environ.get("WARMUP", str(max(200, STEPS // 10))))
+# Warmup. THE setting that caused CTC blank collapse: we used 1,500 where every
+# reference recipe uses 15,000-35,000. "Why does CTC result in peaky behavior?"
+# (arXiv 2105.14849) names aggressive early learning rates as the cause of
+# blank-dominated local convergence, and warmup as the first mitigation. Our LR
+# hit peak at step 1,500; CTC went flat at ~1,200 and never recovered.
+# ESPnet LibriSpeech-100h uses 15,000 absolute; we cap at STEPS//3 so short
+# verification runs still get a sane fraction rather than never leaving warmup.
+WARMUP = int(os.environ.get("WARMUP", str(min(15000, max(200, STEPS // 3)))))
 MAX_FRAMES = int(os.environ.get("MAX_FRAMES", "12000"))
 ACCUM = int(os.environ.get("ACCUM", "2"))
 VOCAB = int(os.environ.get("VOCAB", "256"))
@@ -118,6 +126,34 @@ def sample_chunk_config(rng: random.Random) -> tuple[int, int]:
 
 
 @torch.no_grad()
+def blank_fraction(model, loader, device, max_batches: int = 2) -> float:
+    """Fraction of encoder frames whose CTC argmax is <blank>.
+
+    THE canary for CTC blank collapse — the degenerate minimum where the model
+    discovers that emitting blank everywhere is a safe, finite-loss answer and
+    stops trying to align. It is invisible in the loss (which just goes flat at
+    a plausible-looking value) and invisible in WER (which pins at 1.0 and could
+    equally mean "early"). Measured on this project: 2,000 wasted steps at 100%
+    blank before anyone looked at the actual emissions.
+
+    Healthy is ~0.6-0.9 — blank SHOULD dominate, since there are several frames
+    per token. 1.0 means the model has stopped emitting labels entirely.
+    """
+    model.eval()
+    blanks = total = 0
+    for i, (feats, f_lens, *_rest) in enumerate(loader):
+        if i >= max_batches:
+            break
+        enc, enc_lens = model.encode(feats.to(device), f_lens.to(device))
+        argmax = model.ctc_head(enc).argmax(-1)
+        for b, n in enumerate(enc_lens.tolist()):
+            blanks += int((argmax[b, :n] == BLANK_ID).sum())
+            total += n
+    model.train()
+    return blanks / max(1, total)
+
+
+@torch.no_grad()
 def evaluate(model, loader, tokenizer, device, max_batches: int = 12,
              chunk_size: int = 0, rescore: bool = True) -> tuple[float, list]:
     model.eval()
@@ -141,10 +177,19 @@ def evaluate(model, loader, tokenizer, device, max_batches: int = 12,
 RESUME_PATH = OUT / "_conformer_resume.pt"
 
 
-def save_model(state: dict, path: Path, tokenizer_path: str) -> None:
-    """Ship the weights with the two things that aren't recoverable from them:
-    which tokenizer produced the ids, and whether the conv was causal."""
+def save_model(state: dict, path: Path, tokenizer_path: str,
+               tokenizer_corpus: str = "") -> None:
+    """Ship the weights with what isn't recoverable from them.
+
+    The FINGERPRINT matters as much as the path. A checkpoint's token ids are
+    only meaningful under the exact tokenizer that produced them, and a later
+    run can legitimately regenerate that file in place — which silently
+    remaps every id and turns a working model into one that emits real
+    structure with corrupted spelling. Recording the fingerprint lets the
+    loader refuse instead of guessing.
+    """
     torch.save({"model": state, "tokenizer": tokenizer_path,
+                "tokenizer_corpus": tokenizer_corpus,
                 "causal_conv": True, "n_mels": 80}, path)
 
 
@@ -213,8 +258,11 @@ def main() -> None:
     print(f"model: {SIZE} — {count_parameters(model)/1e6:.1f}M params "
           f"(Module 2's was 2.0M)")
 
+    # weight_decay 1e-6, not the 1e-2 we had: ESPnet's LibriSpeech-100h recipe
+    # uses 1e-6, and 1e-2 is 10,000x more regularisation pressure on a model
+    # that has not yet learned the task.
     opt = torch.optim.AdamW(model.parameters(), lr=LR, betas=(0.9, 0.98),
-                            eps=1e-9, weight_decay=1e-2)
+                            eps=1e-9, weight_decay=float(os.environ.get("WD", "1e-6")))
 
     # ---- train ---------------------------------------------------------
     step, extra = (load_resume(RESUME_PATH, model, opt, device) if RESUME
@@ -266,9 +314,17 @@ def main() -> None:
             mark = ""
             if wer < best_wer:
                 best_wer = wer
-                save_model(model.state_dict(), OUT / "asr_conformer.pt", tok_path)
+                save_model(model.state_dict(), OUT / "asr_conformer.pt", tok_path,
+                           tokenizer.corpus)
                 mark = "  <- new best"
-            print(f"    held-out WER @ {step}: {wer:.3f} (best {best_wer:.3f}){mark}")
+            blank = blank_fraction(model, dev_loader, device)
+            warn = ""
+            if blank > 0.995:
+                warn = ("   *** CTC BLANK COLLAPSE: every frame decodes to blank. "
+                        "The model has stopped emitting labels and will NOT recover. "
+                        "Stop, and lower VOCAB and/or MAX_FRAMES. ***")
+            print(f"    held-out WER @ {step}: {wer:.3f} (best {best_wer:.3f}) "
+                  f"| blank-frames {blank:.3f}{mark}{warn}")
             for pred, ref in samples:
                 print(f"      hyp: {pred}\n      ref: {ref}")
             p = OUT / f"_conformer_step{step}.pt"
@@ -289,7 +345,7 @@ def main() -> None:
         print(f"    averaged WER {wer:.3f} (best single {best_wer:.3f})")
         if wer < best_wer:
             best_wer = wer
-            save_model(avg, OUT / "asr_conformer.pt", tok_path)
+            save_model(avg, OUT / "asr_conformer.pt", tok_path, tokenizer.corpus)
             print("    averaged model wins — saved as outputs/asr_conformer.pt")
 
     # ---- the three numbers that matter --------------------------------

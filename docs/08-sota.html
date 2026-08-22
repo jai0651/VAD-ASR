@@ -14,11 +14,69 @@
      models in this repo — and what it would really take to close it.</p>
 </header>
 <main>
-<div class="crumbs"><a href="index.html">← hub</a> · <a href="07-denoise.html">denoise</a></div>
+<div class="crumbs"><a href="index.html">← contents</a> · <a href="00-crux.html">the crux</a> · <a href="07-denoise.html">denoise</a></div>
 
-<h2><span class="num">8.1</span>The scoreboard</h2>
+<h2><span class="num">8.1</span>The question, and why the obvious answer is wrong</h2>
+
+<p>You have built every stage of a voice agent by hand. The obvious next
+question is the one anyone would ask: <strong>how far is this from the real
+thing, and what would it take to close the distance?</strong></p>
+
+<p>Almost everyone answers immediately, and identically: <em>data</em>. Whisper
+saw 680,000 hours and we saw 100, so of course it is better. Get more data.</p>
+
+<p>That answer is wrong often enough to be dangerous, and this repo contains a
+clean counterexample in each direction.</p>
+
+<div class="grid2">
+<div class="card">
+<h3>Where data is <em>everything</em></h3>
+<p>Module 1's VAD read room ambience as speech — pinned at P≈1, so turns never
+ended. We changed <strong>nothing about the architecture</strong>. Same three
+conv layers, same 55K parameters. Retrained on real audio with real negatives,
+and P on room noise went from 1.0 to 0.04. The bug was entirely in the data.</p>
+</div>
+<div class="card">
+<h3>Where data is <em>irrelevant</em></h3>
+<p>Module 4's TTS sounds phasey and robotic. The cause is Griffin-Lim, which
+<em>guesses</em> the phase discarded in Module 0. It has <strong>zero
+parameters</strong>. You could train the acoustic model on ten thousand hours and
+the output would sound exactly as phasey, because the limitation is not in a
+learned component at all.</p>
+</div>
+</div>
+
+<p>Two stages, same repo, opposite diagnoses. So "we need more data" is not an
+analysis — it is a reflex. To plan anything you need to know
+<strong>what kind of gap</strong> you are looking at.</p>
+
+<h3>Five kinds of gap</h3>
+<p>They are not interchangeable, and they cost wildly different amounts to close:</p>
+<ol>
+<li><strong>Data</strong> — hours, speakers, channels, and above all <em>hard
+negatives</em>. Cheap to describe, expensive to collect.</li>
+<li><strong>Scale</strong> — parameters and compute. 2M versus 600M is three
+orders of magnitude of capacity.</li>
+<li><strong>Architecture</strong> — the inductive bias. Complex masks,
+transducers, flow matching, neural vocoders. <em>This is the one that produces
+hard ceilings</em>, as Griffin-Lim shows.</li>
+<li><strong>Training recipe</strong> — augmentation, schedule, tokenisation,
+checkpoint selection. Usually the cheapest to fix and the most often ignored.</li>
+<li><strong>Inference engineering</strong> — quantisation, runtimes, batching,
+streaming. The difference between a demo and a service.</li>
+</ol>
+
+<div class="crux-q">
+<strong>Why the distinction earns its keep:</strong> a data gap is closed with a
+budget, an architecture gap is closed with a rewrite, and a recipe gap is closed
+in an afternoon. Confusing them is how teams spend six months collecting audio
+for a problem that a different decoder would have solved.
+</div>
+
+<h3>Now the scoreboard reads as an argument</h3>
 <p>One row per stage: what this repo runs, what the best open model is, and —
-the only column that matters for planning — <strong>what kind of gap it is</strong>.</p>
+the only column that matters for planning — <strong>which of the five gaps it
+actually is</strong>.</p>
 
 <div class="tablewrap">
 <table>
@@ -258,28 +316,46 @@ the turn-taking layer upgraded to an audio-native model — which is precisely t
 gap <a href="09-turn-detection.html">§9</a> targets.
 </div>
 
-<h2><span class="num">8.7</span>So what <em>is</em> the difference between ours and production?</h2>
-<p>Five distinct gaps. Naming them separately is what makes the plan tractable.</p>
+<h2><span class="num">8.7</span>Which gap bites where — and what it cost to find out</h2>
+<p>§8.1 introduced the five gaps. Having walked every stage, we can now say
+which one dominates where, and — more useful — what each diagnosis cost when we
+got it wrong.</p>
 
 <div class="tablewrap">
 <table>
-<tr><th>gap</th><th>what it means</th><th>who it bites hardest here</th></tr>
-<tr><td><strong>1. Data</strong></td><td>hours, speakers, languages, channels, and above all <em>hard negatives</em></td><td>VAD (fixed by Module 1b), turn detection</td></tr>
-<tr><td><strong>2. Scale</strong></td><td>parameters and compute; 2M vs 600M is three orders of magnitude of capacity</td><td>ASR</td></tr>
-<tr><td><strong>3. Architecture</strong></td><td>the inductive bias: complex masks, transducers, flow matching, neural vocoders</td><td>TTS, denoise, ASR</td></tr>
-<tr><td><strong>4. Training recipe</strong></td><td>augmentation, LR schedule, tokenisation, curriculum, checkpoint selection</td><td>everything — and it's the cheapest to fix</td></tr>
-<tr><td><strong>5. Inference engineering</strong></td><td>ONNX/CTranslate2, int8, caching, batching, streaming</td><td>the difference between a demo and a service</td></tr>
+<tr><th>gap</th><th>bites hardest at</th><th>evidence from this repo</th></tr>
+<tr><td><strong>1. Data</strong></td><td>VAD, turn detection</td><td>Module 1b: architecture unchanged, data replaced, P(speech) on room noise 1.0 → 0.04</td></tr>
+<tr><td><strong>2. Scale</strong></td><td>ASR</td><td>2M vs 600M is three orders of magnitude; no recipe closes it</td></tr>
+<tr><td><strong>3. Architecture</strong></td><td>TTS, denoise, ASR</td><td>Griffin-Lim: zero parameters, hard ceiling, immune to data</td></tr>
+<tr><td><strong>4. Training recipe</strong></td><td>everything — and cheapest to fix</td><td>see below; this is the one we underestimated twice</td></tr>
+<tr><td><strong>5. Inference engineering</strong></td><td>demo vs service</td><td>whisper int8: 4× smaller, 2–3× faster, &lt;1% relative WER</td></tr>
 </table>
 </div>
 
-<p>Two measured facts from this repo make the point concretely.
-<strong>Recipe beats everything for cheapness:</strong> in both Module 1b and
-Module 4, selecting the checkpoint on the metric we cared about rather than
-taking the last one changed the shipped model materially — the VAD's best
-hard-case score was 0.806 at step 2750 while the final step scored 0.699, and
-the TTS judge oscillated 0.96 → 0.61 with three regressions along the way.
-<strong>Architecture beats data where there's a ceiling:</strong> no quantity of
-LibriSpeech makes Griffin-Lim estimate phase.</p>
+<h3>The recipe gap is the one people underestimate</h3>
+<p>It is the cheapest to fix and the easiest to misdiagnose as something
+expensive. Twice in this project a "we need a better model / more data" problem
+turned out to be a recipe problem:</p>
+<ul>
+<li><strong>Checkpoint selection.</strong> In both Module 1b and Module 4,
+choosing on the metric we cared about rather than taking the last checkpoint
+changed the shipped model materially — the VAD's best hard-case score was
+<strong>0.806 at step 2750 while the final step scored 0.699</strong>, and the
+TTS judge oscillated 0.96 → 0.61 with three regressions. Cost to fix: a few
+lines. Cost of not noticing: shipping a worse model and blaming the data.</li>
+<li><strong>Warmup.</strong> Module 6's CTC head collapsed entirely and the
+instinct was to blame the vocabulary. The cause was a warmup schedule 10× shorter
+than every reference recipe (<a href="12-training-run.html">§12.6</a>). Had we
+"fixed" the vocabulary instead and it happened to work, we would have learned the
+wrong lesson permanently.</li>
+</ul>
+
+<div class="crux-q">
+<strong>The rule that falls out:</strong> diagnose the <em>kind</em> of gap
+before spending. Check the recipe first — it is the cheapest to rule out — then
+architecture, then scale, then data. Most teams do that list in exactly the
+reverse order.
+</div>
 
 <h2><span class="num">8.8</span>Training on open data: the actual recipes</h2>
 
@@ -422,8 +498,8 @@ most expensive way to reach parity with a free model.</li>
 
 </main>
 <footer class="nav">
-  <a href="07-denoise.html">← Noise suppression</a>
-  <a href="09-turn-detection.html">Next: Beating Smart Turn on telephony →</a>
+  <a href="11-vocoder.html">← Vocoder</a>
+  <a href="09-turn-detection.html">Next: Turn detection →</a>
 </footer>
 </body>
 </html>

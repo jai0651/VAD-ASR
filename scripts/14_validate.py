@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.asr.conformer import ConvSubsampling  # noqa: E402
 from src.asr.corpus import (  # noqa: E402
     DynamicBatchSampler,
+    corpus_fingerprint,
     SpeechCorpus,
     build_manifest,
     build_tokenizer,
@@ -48,7 +49,7 @@ from src.asr.corpus import (  # noqa: E402
     warmup_cosine,
 )
 from src.asr.hybrid import HybridCTCAttention, count_parameters  # noqa: E402
-from src.asr.tokenizer import normalize  # noqa: E402
+from src.asr.tokenizer import UNK_ID, normalize  # noqa: E402
 
 SIZES = {
     "tiny":  dict(d_model=144, n_layers=6,  n_heads=4, decoder_layers=2),
@@ -128,6 +129,102 @@ def validate_data(items, tokenizer):
     check("padded regions are zero",
           all(float(f[i, int(f_lens[i]):].abs().sum()) == 0.0 for i in range(4)))
     return batch
+
+
+def validate_silent_failures(items, tokenizer):
+    """The failures that produce no error and no obviously-wrong number.
+
+    Every check here corresponds to something that actually went wrong on this
+    project, or is one step away from it. Loud failures don't need a gate — you
+    see the traceback. These are the ones that quietly burn GPU hours.
+    """
+    section("1b. silent-failure audit")
+
+    # --- the tokenizer/corpus mismatch that actually happened -------------
+    fp = corpus_fingerprint(items)
+    check("tokenizer was fitted on THIS corpus", tokenizer.corpus == fp,
+          f"tokenizer={tokenizer.corpus or 'unrecorded'} corpus={fp}")
+
+    # --- how much of the corpus can it even represent? --------------------
+    unk = tot = 0
+    for it in items[:500]:
+        ids = tokenizer.encode(it["text"])
+        unk += sum(1 for i in ids if i == UNK_ID)
+        tot += len(ids)
+    rate = unk / max(1, tot)
+    check("<unk> rate is negligible", rate < 0.001, f"{rate:.4%} of tokens")
+
+    # --- transcripts that vanish under normalisation ----------------------
+    empty = [it for it in items[:2000] if not tokenizer.encode(it["text"])]
+    check("no transcript encodes to an empty target", not empty,
+          f"{len(empty)} empty targets -> CTC contributes nothing for them")
+
+    # --- CTC feasibility, the version that accounts for SPEED PERTURB -----
+    # 1.1x speed shortens the audio by 10% but leaves the transcript alone, so
+    # the frames/token ratio the model actually trains on is WORSE than the one
+    # you get from raw durations. Validating on raw durations flatters you.
+    # CTC also needs a blank between adjacent repeated tokens, so the true
+    # requirement is T >= len(y) + repeats, not T >= len(y).
+    fastest = 1.1
+    worst, violations, ratios = 1e9, 0, []
+    for it in items[: min(3000, len(items))]:
+        n_mel = 1 + int((it["duration"] / fastest * 16000 - 400) // 160)
+        n_enc = int(ConvSubsampling.out_length(torch.tensor([n_mel]))[0])
+        ids = tokenizer.encode(it["text"])
+        repeats = sum(1 for a, b in zip(ids, ids[1:]) if a == b)
+        need = len(ids) + repeats
+        if need and n_enc < need:
+            violations += 1
+        if need:
+            ratios.append(n_enc / need)
+            worst = min(worst, n_enc / need)
+    check("CTC is feasible at the FASTEST speed, counting repeats",
+          violations == 0,
+          f"worst frames/token {worst:.2f}" if not violations
+          else f"{violations} utterances train on a SILENT zero gradient "
+               f"(zero_infinity hides them)")
+
+    # --- blank-dominance, the collapse risk indicator ---------------------
+    med = float(np.median(ratios)) if ratios else 0.0
+    check("frames-per-token is not extreme (blank-collapse risk)",
+          med < 12.0,
+          f"median {med:.1f}. Higher means blank dominates the target "
+          f"distribution and the all-blank minimum gets more attractive")
+
+    # --- audio that is silent / all zeros ---------------------------------
+    import soundfile as sf
+
+    quiet = []
+    for it in items[:: max(1, len(items) // 40)][:40]:
+        wav, _ = sf.read(it["path"], dtype="float32")
+        if wav.size == 0 or float(np.sqrt(np.mean(wav ** 2))) < 1e-4:
+            quiet.append(it["path"])
+    check("no silent/empty audio in the sample", not quiet, f"{len(quiet)} silent files")
+
+    # --- SpecAugment must not erase a whole utterance ---------------------
+    shortest = min(it["duration"] for it in items)
+    n_short = 1 + int((shortest / fastest * 16000 - 400) // 160)
+    masked = 2 * min(40, max(1, int(n_short * 0.05)))
+    check("SpecAugment cannot erase the shortest utterance",
+          masked < 0.5 * n_short,
+          f"shortest {shortest:.1f}s = {n_short} frames, up to {masked} masked")
+
+
+def validate_split(train_items, dev_items):
+    section("1c. train / held-out split")
+    tr = {it["path"] for it in train_items}
+    dv = {it["path"] for it in dev_items}
+    check("held-out set does not leak into training", not (tr & dv),
+          f"{len(tr & dv)} shared utterances" if (tr & dv) else
+          f"{len(tr)} train / {len(dv)} held-out, disjoint")
+    tr_spk = {Path(p).parts[-3] for p in tr}
+    dv_spk = {Path(p).parts[-3] for p in dv}
+    overlap = len(tr_spk & dv_spk)
+    # Not a failure — LibriSpeech dev-clean shares speakers by design when you
+    # split a single split. But it inflates held-out WER, so it must be stated.
+    check("speaker overlap is reported (not necessarily an error)", True,
+          f"{overlap}/{len(dv_spk)} held-out speakers also in train — "
+          f"held-out WER is optimistic by that much")
 
 
 def validate_model(batch, tokenizer, device):
@@ -282,7 +379,14 @@ def main() -> None:
     items = build_manifest(split=SPLIT)
     tokenizer = build_tokenizer(items, VOCAB, Path("outputs") / f"bpe_{VOCAB}.json")
 
+    rng = random.Random(1234)
+    shuffled = list(items); rng.shuffle(shuffled)
+    n_dev = max(1, min(300, len(shuffled) // 10))
+    dev_items, train_items = shuffled[:n_dev], shuffled[n_dev:]
+
     batch = validate_data(items, tokenizer)
+    validate_silent_failures(items, tokenizer)
+    validate_split(train_items, dev_items)
     model = validate_model(batch, tokenizer, device)
     validate_streaming_and_decode(model, batch, tokenizer, device)
     validate_learning(items, tokenizer, device)

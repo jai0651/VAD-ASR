@@ -82,3 +82,10 @@ footer.nav { max-width: 900px; margin: 0 auto; padding: 0 20px 60px;
   display: flex; justify-content: space-between; gap: 12px; }
 footer.nav a { font-family: var(--mono); font-size: 14px; padding: 10px 16px;
   border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+
+/* Book devices: the question a section is answering, and the signpost between
+   sections. Used to make a chapter read as an argument rather than a reference. */
+.crux-q { border-left: 3px solid var(--accent-3); background: var(--card-2);
+  border-radius: 0 10px 10px 0; padding: 12px 16px; margin: 18px 0;
+  font-size: 15.5px; }
+.crux-q strong { color: var(--accent-3); }

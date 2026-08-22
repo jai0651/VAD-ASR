@@ -68,9 +68,16 @@ class BPETokenizer:
     """Byte-pair encoding over words. `merges` is an ORDERED list — the order
     is the algorithm, since encoding replays the merges in the same sequence."""
 
-    def __init__(self, merges: list[tuple[str, str]], vocab: list[str]):
+    def __init__(self, merges: list[tuple[str, str]], vocab: list[str],
+                 corpus: str = ""):
         self.merges = [tuple(m) for m in merges]
         self.vocab = vocab
+        # Fingerprint of the corpus this was TRAINED on. Carried in the file so
+        # a tokenizer can never be silently reused across datasets — which is
+        # exactly what happened here: a tokenizer fitted on dev-clean (2,557
+        # utterances) was picked up for a train-clean-100 run (28,500) because
+        # the only check was `vocab_size`. Merges learned from 11x less text.
+        self.corpus = corpus
         self.token_to_id = {t: i for i, t in enumerate(vocab)}
         self._ranks = {pair: i for i, pair in enumerate(self.merges)}
         self._cache: dict[str, list[str]] = {}
@@ -185,10 +192,11 @@ class BPETokenizer:
 
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(
-            {"merges": [list(m) for m in self.merges], "vocab": self.vocab}
+            {"merges": [list(m) for m in self.merges], "vocab": self.vocab,
+             "corpus": self.corpus}
         ))
 
     @classmethod
     def load(cls, path: str | Path) -> "BPETokenizer":
         d = json.loads(Path(path).read_text())
-        return cls(d["merges"], d["vocab"])
+        return cls(d["merges"], d["vocab"], d.get("corpus", ""))
