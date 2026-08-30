@@ -19,6 +19,8 @@ dependencies = [
     "kokoro-onnx>=0.4",
     "anthropic>=0.116.0",
     "openai>=2.44.0",
+    # --- voice cloning (Module 8): microphone capture for the recording harness ---
+    "sounddevice>=0.4.6",
 ]
 
 [dependency-groups]

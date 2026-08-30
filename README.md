@@ -38,6 +38,8 @@ becomes a product.
 | **5. Noise suppression** | Streaming denoiser **from scratch** | STFT gain estimation, MCRA noise tracking, decision-directed SNR, log-MMSE / OM-LSA, why neural models won |
 | **6. Modern ASR** | Conformer + hybrid CTC/attention **from scratch** | BPE subwords, relative-position attention, macaron blocks, dynamic chunk streaming, SpecAugment, warmup/cosine, checkpoint averaging |
 | **7. Neural vocoder** | ISTFT vocoder (Vocos-style) **from scratch** | why Griffin-Lim is a ceiling, ConvNeXt blocks, magnitude+phase heads, exact overlap-add via `fold`, multi-resolution STFT loss |
+| **8. Your voice** | A TTS that replies in *your* voice | corpus design by greedy n-gram balancing, VAD-gated capture, data QC gates, speaker embeddings, fine-tuning |
+| **9. Speaker ID** | Speaker embeddings (voiceprints) **from scratch** | attentive statistics pooling, AAM-softmax angular margin, ECAPA-TDNN, EER/minDCF, held-out-speaker evaluation, bootstrap CIs |
 
 ## Setup
 
@@ -62,7 +64,49 @@ uv run python scripts/10_denoise_bench.py # does noise suppression actually help
 uv run python scripts/11_train_asr_conformer.py # the MODERN ASR (Module 6)
 uv run python scripts/12_train_vocoder.py # neural vocoder vs Griffin-Lim (Module 7)
 uv run python scripts/13_asr_compare.py   # Module 2 vs Module 6 vs Whisper, same audio
+uv run python scripts/20_speaker_intuition.py # is a voice visible in a spectrogram? (Module 9)
+uv run python scripts/21_train_speaker.py   # train the voiceprint (-> outputs/speaker.pt)
+uv run python scripts/16_record_voice.py  # record YOUR voice for Module 8 (-> data/voice/)
 ```
+
+### Recording your own voice (Module 8, `scripts/16_record_voice.py`)
+
+A TTS that replies in your voice does **not** need zero-shot cloning. Zero-shot
+solves the harder problem of imitating *any* voice from ten seconds, and
+training one needs thousands of speakers. A **single-speaker model trained on
+you** cannot sound like anyone else — that is the whole trick, and it needs
+about an hour of your speech.
+
+```bash
+uv run python scripts/16_record_voice.py            # press ENTER, read, stop talking
+uv run python scripts/16_record_voice.py --minutes 20   # start smaller; extend later
+```
+
+Press ENTER, read the sentence, stop talking — your **Module 1 VAD** hears the
+pause and ends the take. Every take is then run past four gates before it
+counts (`src/tts/qc.py`): clipping, noise floor, silence padding, and a
+transcription check against the prompt. Accepted takes are flushed immediately
+and the manifest is append-only, so closing the laptop mid-corpus costs you one
+sentence.
+
+Two decisions in there are worth more than the code:
+
+- **The prompt set is selected, not sampled.** `src/tts/prompts.py` greedily
+  picks sentences that best help the *rarest* character n-grams, seeded with
+  ~100 hand-written conversational lines so the voice learns to answer rather
+  than to narrate. Plain "cover everything once" set cover saturates at 576
+  sentences and stops; frequency balancing does not, because a trigram seen
+  once is not learnable. Against a random sample of the same size: **99.9% vs
+  92.2% coverage, median count 5 vs 4.**
+- **The read-check is Whisper, not your Conformer.** A verifier must be more
+  accurate than the thing it verifies. Your Module 6 model scores CER 0.276 on
+  LibriSpeech and worse on an unseen speaker, so it would flag good takes and
+  make the corpus worse while looking rigorous. It stays behind `--asr scratch`
+  because watching it false-alarm teaches that better than reading it here.
+
+Audio is captured at 48 kHz and stored at **24 kHz** even though every model in
+this repo runs at 16 kHz. You can always downsample; you can never invent the
+missing octave, and you only record this once.
 
 ### Does the modern architecture actually help? (`scripts/13_asr_compare.py`)
 
@@ -80,6 +124,59 @@ and added streaming for a 3% relative cost. The remaining 18× gap to Whisper is
 165,000× more data — which is exactly the point of Module 6.
 
 Each writes a plot or wav to `outputs/`. Open them to *see/hear* what each stage does.
+
+### Can it tell who is talking? (Module 9)
+
+A speaker encoder is the mirror image of the ASR encoder: the same log-mel goes
+in, but it is trained to throw the *words* away and keep the *voice*. One 192-d
+vector per clip, and cosine distance answers "same person?" — for people it has
+never heard.
+
+Measured on dev-clean with 8 speakers held out of training entirely, 4000
+trials, all three scored on one identical trial list:
+
+| system | EER (95% CI) | minDCF | median over evals |
+|---|---|---|---|
+| log-mel mean+std, no training at all | 11.10% [10.04, 12.24] | 0.504 | — |
+| ECAPA-lite + plain softmax | 7.50% [6.80, 8.30] | 0.426 | 8.35% |
+| ECAPA-lite + AAM-softmax | 6.80% [6.13, 7.44] | 0.427 | 8.35% |
+
+**Training clearly works** — both encoders beat the untrained floor with no
+overlap in the intervals. **The AAM-vs-plain comparison does not resolve**: the
+intervals overlap, the minDCFs are a thousandth apart, and the medians across
+evaluations are identical. Every current speaker system uses an angular margin
+and the reasoning is in `src/speaker/loss.py`, but 32 training speakers cannot
+demonstrate it, and this table says so rather than picking the flattering cell.
+
+Two things worth stealing from this module even if you never build a speaker ID:
+
+- **The untrained floor is stronger than it looks, for the wrong reason.** Raw
+  log-mel mean alone scores 10.90% — but in LibriSpeech each speaker is one
+  person at one mic in one room, so much of that is recognising the *recording*.
+  After mean normalisation it collapses to chance, while the std is
+  mathematically untouched by it. That is why the trained model is fed
+  mean-normalised features even though it costs the strongest free cue.
+- **Best-of-N checkpoint selection is itself an overfit.** The AAM run's best
+  eval is 6.80% and its worst is 8.85%; picking the minimum of a noisy
+  sequence is biased low by construction. Script 21 prints the best, the median,
+  and a bootstrap CI separately so they cannot be confused.
+
+32 speakers is the binding constraint — speaker encoders are hungrier for
+*speakers* than for hours, and production ECAPA trains on ~6000 (VoxCeleb2) for
+sub-1% EER. Same lesson as Module 6, different axis.
+
+```bash
+uv run python scripts/20_speaker_intuition.py           # the untrained floor
+uv run python scripts/21_train_speaker.py               # train it
+LOSS=plain uv run python scripts/21_train_speaker.py    # the A/B above
+ARCH=xvector uv run python scripts/21_train_speaker.py  # the 2018 baseline
+SPLIT=train-clean-100 DOWNLOAD=1 STEPS=30000 CHANNELS=512 \
+  uv run python scripts/21_train_speaker.py             # 251 speakers, the real run
+bash scripts/fetch_youtube_audio.sh '<url>' interview   # a real mixed tape
+```
+
+Diarization ("who spoke when" in a mixed tape) and the tag-a-speaker gallery
+("who is who across tapes") build on this encoder and are not written yet.
 
 ## The live voice agent (Module 3)
 
@@ -174,6 +271,10 @@ Run the tests: `uv run pytest -q` (endpointing, orchestrator/barge-in, audio I/O
 | `src/asr/search.py` | log-space CTC prefix beam over subwords + WER |
 | `src/tts/model.py` | Tacotron-mini: attention seq2seq text→mel |
 | `src/tts/vocoder.py` | Griffin-Lim + hand-built STFT/ISTFT (mel→audio) |
+| `src/speaker/data.py` | speaker-labelled crops; speed perturb as a NEW class |
+| `src/speaker/model.py` | ECAPA-lite / x-vector encoder + attentive statistics pooling |
+| `src/speaker/loss.py` | AAM-softmax angular margin (and the plain-softmax baseline) |
+| `src/speaker/verify.py` | cosine scoring, trial lists, EER + minDCF + bootstrap CI |
 | `src/denoise/spectral.py` | MCRA + decision-directed + log-MMSE/OM-LSA denoiser, by hand |
 | `src/denoise/onnx_engines.py` | GTCRN / DTLN streaming denoisers (production alternates) |
 | `src/pipeline/denoise.py` | the denoise stage + which stages consume clean audio |
