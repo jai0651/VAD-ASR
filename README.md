@@ -1,5 +1,7 @@
 # A Voice Agent From Scratch (for learning)
 
+![Voice agent from scratch](docs/thumbnail.png)
+
 Build **Voice Activity Detection**, **Automatic Speech Recognition**,
 **Text-to-Speech**, and the **real-time voice pipeline** that connects them —
 from the ground up in PyTorch, understanding every layer instead of calling a
